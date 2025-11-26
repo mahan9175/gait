@@ -524,7 +524,7 @@ if __name__ == '__main__':
   # Count folds for downstream task (using the correct flat structure)
   if params['task'] == 'downstream':
 #    num_folds = count_folds(params['data_path'])
-    num_folds = 5 
+    num_folds = 10 
     # Validate fold count
     if num_folds == 0:
         print(f"\nERROR: No valid data found in {params['data_path']}")
