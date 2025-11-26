@@ -53,11 +53,17 @@ import models.PoseEncoderDecoder as PoseEncoderDecoder
 import data.NTURGDDataset as NTURGDDataset
 import data.GaitJointsDataset as GaitJointsDataset
 import utils.utils as utils
+import torch.nn.functional as F
+
 
 _DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 _WEIGHT_DECAY = 0.00001
 _NSEEDS = 8
 
+def focal_loss(logits, targets, alpha=None, gamma=2):
+    ce = F.cross_entropy(logits, targets, weight=alpha, reduction='none')
+    pt = torch.exp(-ce)
+    return ((1-pt)**gamma * ce).mean()
 class POTRModelFn(seq2seq_model_fn.ModelFn):
   def __init__(self,
                params,
@@ -94,8 +100,15 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
         weights = weights / weights.sum()
         
         self._loss_weights = weights.to(_DEVICE)
-        self._weighted_ce_loss = nn.CrossEntropyLoss(weight=self._loss_weights)
-        print(f'Using weighted CE loss with weights: {weights.cpu().numpy().tolist()}')
+        
+        # REPLACED: CrossEntropyLoss with focal loss
+        # self._weighted_ce_loss = nn.CrossEntropyLoss(weight=self._loss_weights)
+        
+        # Use focal loss instead - note: we'll call the focal_loss function directly
+        # We store the weights and gamma parameter for use in the loss function
+        self._focal_loss_alpha = self._loss_weights
+        self._focal_loss_gamma = 2.0  # You can make this configurable via params if needed
+        print(f'Using focal loss with weights: {weights.cpu().numpy().tolist()} and gamma={self._focal_loss_gamma}')
     else:
         print('Using a standard CE loss for activity prediction.')
         
@@ -110,7 +123,9 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
     """Computes entropy loss from logits between predictions and class."""
     class_gt = class_gt.long()  # Convert to long type
     if self.task == 'downstream':
-        return self._weighted_ce_loss(logits, class_gt)
+        # REPLACED: Use focal loss instead of cross entropy
+        # return self._weighted_ce_loss(logits, class_gt)
+        return focal_loss(logits, class_gt, alpha=self._focal_loss_alpha, gamma=self._focal_loss_gamma)
     else:
         return nn.functional.cross_entropy(logits, class_gt, reduction='mean')
 
@@ -375,11 +390,44 @@ def count_folds(data_path):
     
     return len(valid_folds)
 
+# def compute_comprehensive_metrics(y_true, y_pred, num_classes):
+#     """
+#     Compute comprehensive classification metrics including per-class and overall metrics.
+#     """
+#     metrics = {}
+    
+#     # Basic metrics
+#     metrics['accuracy'] = accuracy_score(y_true, y_pred)
+#     metrics['precision_macro'] = precision_score(y_true, y_pred, average='macro', zero_division=0)
+#     metrics['recall_macro'] = recall_score(y_true, y_pred, average='macro', zero_division=0)
+#     metrics['f1_macro'] = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    
+#     metrics['precision_weighted'] = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+#     metrics['recall_weighted'] = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+#     metrics['f1_weighted'] = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+    
+#     # Per-class metrics
+#     if num_classes > 1:
+#         metrics['precision_per_class'] = precision_score(y_true, y_pred, average=None, zero_division=0).tolist()
+#         metrics['recall_per_class'] = recall_score(y_true, y_pred, average=None, zero_division=0).tolist()
+#         metrics['f1_per_class'] = f1_score(y_true, y_pred, average=None, zero_division=0).tolist()
+    
+#     # Confusion matrix
+#     metrics['confusion_matrix'] = confusion_matrix(y_true, y_pred).tolist()
+    
+#     # Class distribution
+#     metrics['true_class_distribution'] = np.bincount(y_true, minlength=num_classes).tolist()
+#     metrics['pred_class_distribution'] = np.bincount(y_pred, minlength=num_classes).tolist()
+    
+#     return metrics
 def compute_comprehensive_metrics(y_true, y_pred, num_classes):
     """
     Compute comprehensive classification metrics including per-class and overall metrics.
     """
     metrics = {}
+    
+    # Get actual number of classes from data
+    actual_num_classes = len(np.unique(np.concatenate([y_true, y_pred])))
     
     # Basic metrics
     metrics['accuracy'] = accuracy_score(y_true, y_pred)
@@ -392,7 +440,7 @@ def compute_comprehensive_metrics(y_true, y_pred, num_classes):
     metrics['f1_weighted'] = f1_score(y_true, y_pred, average='weighted', zero_division=0)
     
     # Per-class metrics
-    if num_classes > 1:
+    if actual_num_classes > 1:
         metrics['precision_per_class'] = precision_score(y_true, y_pred, average=None, zero_division=0).tolist()
         metrics['recall_per_class'] = recall_score(y_true, y_pred, average=None, zero_division=0).tolist()
         metrics['f1_per_class'] = f1_score(y_true, y_pred, average=None, zero_division=0).tolist()
@@ -401,11 +449,10 @@ def compute_comprehensive_metrics(y_true, y_pred, num_classes):
     metrics['confusion_matrix'] = confusion_matrix(y_true, y_pred).tolist()
     
     # Class distribution
-    metrics['true_class_distribution'] = np.bincount(y_true, minlength=num_classes).tolist()
-    metrics['pred_class_distribution'] = np.bincount(y_pred, minlength=num_classes).tolist()
+    metrics['true_class_distribution'] = np.bincount(y_true, minlength=actual_num_classes).tolist()
+    metrics['pred_class_distribution'] = np.bincount(y_pred, minlength=actual_num_classes).tolist()
     
     return metrics
-
 def print_detailed_report(y_true, y_pred, num_classes):
     """
     Print a detailed classification report with comprehensive metrics.
@@ -413,6 +460,9 @@ def print_detailed_report(y_true, y_pred, num_classes):
     print("\n" + "="*80)
     print("COMPREHENSIVE CLASSIFICATION REPORT")
     print("="*80)
+    
+    # Get the actual number of classes from the data
+    actual_num_classes = len(np.unique(np.concatenate([y_true, y_pred])))
     
     # Basic metrics
     accuracy = accuracy_score(y_true, y_pred)
@@ -435,36 +485,97 @@ def print_detailed_report(y_true, y_pred, num_classes):
     print(f"  Recall:      {recall_weighted:.4f} (weighted)")
     print(f"  F1-Score:    {f1_weighted:.4f} (weighted)")
     
-    # Per-class metrics
-    if num_classes > 1:
+    # Per-class metrics - use actual_num_classes instead of num_classes parameter
+    if actual_num_classes > 1:
         print(f"\nPer-Class Metrics:")
         precision_per_class = precision_score(y_true, y_pred, average=None, zero_division=0)
         recall_per_class = recall_score(y_true, y_pred, average=None, zero_division=0)
         f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
         
-        for i in range(num_classes):
+        for i in range(actual_num_classes):  # Use actual_num_classes here
             print(f"  Class {i}: Precision={precision_per_class[i]:.4f}, "
                   f"Recall={recall_per_class[i]:.4f}, F1={f1_per_class[i]:.4f}")
     
     # Confusion matrix
     cm = confusion_matrix(y_true, y_pred)
     print(f"\nConfusion Matrix:")
-    print(" " * 8 + "".join([f"Pred {i:>6}" for i in range(num_classes)]))
-    for i in range(num_classes):
+    print(" " * 8 + "".join([f"Pred {i:>6}" for i in range(actual_num_classes)]))  # Use actual_num_classes here
+    for i in range(actual_num_classes):  # Use actual_num_classes here
         if i == 0:
             print(f"True {i}  " + " ".join([f"{val:6d}" for val in cm[i]]))
         else:
             print(f"     {i}  " + " ".join([f"{val:6d}" for val in cm[i]]))
     
     # Class distribution
-    true_dist = np.bincount(y_true, minlength=num_classes)
-    pred_dist = np.bincount(y_pred, minlength=num_classes)
+    true_dist = np.bincount(y_true, minlength=actual_num_classes)  # Use actual_num_classes here
+    pred_dist = np.bincount(y_pred, minlength=actual_num_classes)  # Use actual_num_classes here
     
     print(f"\nClass Distribution:")
     print(f"  True: {dict(enumerate(true_dist))}")
     print(f"  Pred: {dict(enumerate(pred_dist))}")
     
     print("="*80)
+    
+    return actual_num_classes  # Return the actual number of classes found
+# def print_detailed_report(y_true, y_pred, num_classes):
+#     """
+#     Print a detailed classification report with comprehensive metrics.
+#     """
+#     print("\n" + "="*80)
+#     print("COMPREHENSIVE CLASSIFICATION REPORT")
+#     print("="*80)
+    
+#     # Basic metrics
+#     accuracy = accuracy_score(y_true, y_pred)
+#     precision_macro = precision_score(y_true, y_pred, average='macro', zero_division=0)
+#     recall_macro = recall_score(y_true, y_pred, average='macro', zero_division=0)
+#     f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    
+#     print(f"\nOverall Metrics:")
+#     print(f"  Accuracy:    {accuracy:.4f}")
+#     print(f"  Precision:   {precision_macro:.4f} (macro)")
+#     print(f"  Recall:      {recall_macro:.4f} (macro)")
+#     print(f"  F1-Score:    {f1_macro:.4f} (macro)")
+    
+#     # Weighted metrics
+#     precision_weighted = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+#     recall_weighted = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+#     f1_weighted = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+    
+#     print(f"  Precision:   {precision_weighted:.4f} (weighted)")
+#     print(f"  Recall:      {recall_weighted:.4f} (weighted)")
+#     print(f"  F1-Score:    {f1_weighted:.4f} (weighted)")
+    
+#     # Per-class metrics
+#     if num_classes > 1:
+#         print(f"\nPer-Class Metrics:")
+#         precision_per_class = precision_score(y_true, y_pred, average=None, zero_division=0)
+#         recall_per_class = recall_score(y_true, y_pred, average=None, zero_division=0)
+#         f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
+        
+#         for i in range(num_classes):
+#             print(f"  Class {i}: Precision={precision_per_class[i]:.4f}, "
+#                   f"Recall={recall_per_class[i]:.4f}, F1={f1_per_class[i]:.4f}")
+    
+#     # Confusion matrix
+#     cm = confusion_matrix(y_true, y_pred)
+#     print(f"\nConfusion Matrix:")
+#     print(" " * 8 + "".join([f"Pred {i:>6}" for i in range(num_classes)]))
+#     for i in range(num_classes):
+#         if i == 0:
+#             print(f"True {i}  " + " ".join([f"{val:6d}" for val in cm[i]]))
+#         else:
+#             print(f"     {i}  " + " ".join([f"{val:6d}" for val in cm[i]]))
+    
+#     # Class distribution
+#     true_dist = np.bincount(y_true, minlength=num_classes)
+#     pred_dist = np.bincount(y_pred, minlength=num_classes)
+    
+#     print(f"\nClass Distribution:")
+#     print(f"  True: {dict(enumerate(true_dist))}")
+#     print(f"  Pred: {dict(enumerate(pred_dist))}")
+    
+#     print("="*80)
 
 if __name__ == '__main__':
   parser = argparse.ArgumentParser()
