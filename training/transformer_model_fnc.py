@@ -169,12 +169,34 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
     )
 
   def select_optimizer(self):
-    optimizer = optim.AdamW(
-        self._model.parameters(), lr=self._params['learning_rate'],
+    # For imbalanced datasets, consider these optimizers:
+    
+    # Option 1: AdamW with adjusted parameters (recommended)
+    # optimizer = optim.AdamW(
+    #     self._model.parameters(), 
+    #     lr=self._params['learning_rate'],
+    #     betas=(0.9, 0.999),
+    #     weight_decay=_WEIGHT_DECAY
+    # )
+    
+    # Option 2: SGD with momentum (sometimes better for imbalanced data)
+    # optimizer = optim.SGD(
+    #     self._model.parameters(),
+    #     lr=self._params['learning_rate'],
+    #     momentum=0.9,
+    #     weight_decay=_WEIGHT_DECAY,
+    #     nesterov=True
+    # )
+    
+    # Option 3: Adam with AMSGrad (more stable for imbalanced data)
+    optimizer = optim.Adam(
+        self._model.parameters(),
+        lr=self._params['learning_rate'],
         betas=(0.9, 0.999),
-        weight_decay=_WEIGHT_DECAY
+        weight_decay=_WEIGHT_DECAY,
+        amsgrad=True
     )
-
+    
     return optimizer
 
   # NEW: Override train method to add CSV logging
