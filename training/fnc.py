@@ -223,22 +223,22 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
             # )
             
             # Option 2: SGD with momentum (sometimes better for imbalanced data)
-            # optimizer = optim.SGD(
-            #     self._model.parameters(),
-            #     lr=self._params['learning_rate'],
-            #     momentum=0.9,
-            #     weight_decay=_WEIGHT_DECAY,
-            #     nesterov=True
-            # )
-            
-            # Option 3: Adam with AMSGrad (more stable for imbalanced data)
-            optimizer = optim.Adam(
+            optimizer = optim.SGD(
                 self._model.parameters(),
                 lr=self._params['learning_rate'],
-                betas=(0.9, 0.999),
+                momentum=0.9,
                 weight_decay=_WEIGHT_DECAY,
-                amsgrad=True
+                nesterov=True
             )
+            
+            # Option 3: Adam with AMSGrad (more stable for imbalanced data)
+            # optimizer = optim.Adam(
+            #     self._model.parameters(),
+            #     lr=self._params['learning_rate'],
+            #     betas=(0.9, 0.999),
+            #     weight_decay=_WEIGHT_DECAY,
+            #     amsgrad=True
+            # )
             
             return optimizer
 
