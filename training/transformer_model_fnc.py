@@ -708,8 +708,7 @@ if __name__ == '__main__':
     )
     
     # NEW: Update model with actual fold class distribution
-    train_loader = train_dataset_fn()  # Create the train loader
-    model_fn.update_fold_weights(train_loader)  # Compute per-fold weights
+    model_fn.update_fold_weights(train_dataset_fn)  # Compute per-fold weights
     
     # NEW: Set current fold for CSV logging
     model_fn.csv_logger.current_fold = fold
