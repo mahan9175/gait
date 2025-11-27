@@ -84,7 +84,7 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
             # Placeholder - will be updated with real fold distribution in train_model()
             self._loss_weights = None
             self._focal_loss_alpha = None  # Will be set per-fold
-            self._focal_loss_gamma = 2.0
+            self._focal_loss_gamma = 3.0
             
             print(f'Focal loss initialized - weights will be computed per-fold with gamma={self._focal_loss_gamma}')
         else:
@@ -212,14 +212,35 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
         )
 
     def select_optimizer(self):
-        # Using AdamW with reduced learning rate for better stability
-        return optim.AdamW(
-            self._model.parameters(),
-            lr=self._params['learning_rate'] * 0.1,  # Reduced LR for stability
-            betas=(0.9, 0.98),                       # More stable betas
-            eps=1e-9,
-            weight_decay=_WEIGHT_DECAY
-        )
+            # For imbalanced datasets, consider these optimizers:
+            
+            # Option 1: AdamW with adjusted parameters (recommended)
+            # optimizer = optim.AdamW(
+            #     self._model.parameters(), 
+            #     lr=self._params['learning_rate'],
+            #     betas=(0.9, 0.999),
+            #     weight_decay=_WEIGHT_DECAY
+            # )
+            
+            # Option 2: SGD with momentum (sometimes better for imbalanced data)
+            # optimizer = optim.SGD(
+            #     self._model.parameters(),
+            #     lr=self._params['learning_rate'],
+            #     momentum=0.9,
+            #     weight_decay=_WEIGHT_DECAY,
+            #     nesterov=True
+            # )
+            
+            # Option 3: Adam with AMSGrad (more stable for imbalanced data)
+            optimizer = optim.Adam(
+                self._model.parameters(),
+                lr=self._params['learning_rate'],
+                betas=(0.9, 0.999),
+                weight_decay=_WEIGHT_DECAY,
+                amsgrad=True
+            )
+            
+            return optimizer
 
     # NEW: Override train method to add CSV logging
     def train(self):
