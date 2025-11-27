@@ -64,6 +64,7 @@ def focal_loss(logits, targets, alpha=None, gamma=3):
     ce = F.cross_entropy(logits, targets, weight=alpha, reduction='none')
     pt = torch.exp(-ce)
     return ((1-pt)**gamma * ce).mean()
+
 class POTRModelFn(seq2seq_model_fn.ModelFn):
     def __init__(self,
                  params,
@@ -91,53 +92,72 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
             print('Using a standard CE loss for activity prediction.')
             
     def update_fold_weights(self, train_loader):
-    """Compute class weights from actual fold data distribution"""
-    if self.task != 'downstream':
-        return
-    
-    class_counts = torch.zeros(4, dtype=torch.float32)
-    
-    # Count actual samples in this fold
-    for batch in train_loader:
-        # The batch structure might be different - let's handle various cases
-        if isinstance(batch, (list, tuple)):
-            # If batch is (data, labels) or (data, labels, ...)
-            if len(batch) >= 2:
-                labels = batch[1]  # labels are typically the second element
-            else:
-                labels = batch[0]  # if only one element, assume it's labels
-        else:
-            # If batch is a dictionary or other structure
-            # Try common label keys
-            if hasattr(batch, 'labels'):
-                labels = batch.labels
-            elif 'labels' in batch:
-                labels = batch['labels']
-            elif 'targets' in batch:
-                labels = batch['targets']
-            elif 'activity' in batch:
-                labels = batch['activity']
-            else:
-                # Last resort: assume the last element is labels
-                labels = batch[-1]
+        """Compute class weights from actual fold data distribution"""
+        if self.task != 'downstream':
+            return
         
-        # Ensure labels are in the right format
-        labels = labels.long()
-        class_counts += torch.bincount(labels, minlength=4)
-    
-    # Prevent division by zero for missing classes
-    class_counts = torch.clamp(class_counts, min=1)
-    
-    # Compute weights (inverse frequency)
-    freq = class_counts / class_counts.sum()
-    weights = 1.0 / (freq + 1e-6)  # small epsilon for stability
-    weights = weights / weights.sum()  # normalize
-    
-    self._focal_loss_alpha = weights.to(_DEVICE)
-    self._loss_weights = weights.to(_DEVICE)
-    
-    print(f"📊 Fold class distribution: {class_counts.cpu().numpy()}")
-    print(f"⚖️  Computed focal loss weights: {weights.cpu().numpy()}")
+        class_counts = torch.zeros(4, dtype=torch.float32)
+        
+        # Debug: check the first batch structure
+        first_batch = next(iter(train_loader))
+        print(f"🔍 Debug - Batch type: {type(first_batch)}")
+        if hasattr(first_batch, '__len__'):
+            print(f"🔍 Debug - Batch length: {len(first_batch)}")
+        
+        if isinstance(first_batch, (list, tuple)):
+            for i, item in enumerate(first_batch):
+                print(f"🔍 Debug - Batch item {i}: type={type(item)}, shape={item.shape if hasattr(item, 'shape') else 'N/A'}")
+        
+        # Count actual samples in this fold - process just a few batches to understand structure
+        batch_count = 0
+        for batch in train_loader:
+            # Based on debug output, adjust this part
+            if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                # Most common case: (data, labels)
+                labels = batch[1]
+            elif isinstance(batch, dict):
+                # Try common label keys in dictionaries
+                if 'labels' in batch:
+                    labels = batch['labels']
+                elif 'targets' in batch:
+                    labels = batch['targets']
+                elif 'activity' in batch:
+                    labels = batch['activity']
+                else:
+                    print(f"🔍 Debug - Batch keys: {batch.keys()}")
+                    # Use the first tensor value as labels
+                    for key, value in batch.items():
+                        if torch.is_tensor(value):
+                            labels = value
+                            break
+            else:
+                # If batch is a single tensor, assume it's labels
+                labels = batch
+            
+            # Ensure labels are in the right format
+            if torch.is_tensor(labels):
+                labels = labels.long()
+                class_counts += torch.bincount(labels, minlength=4)
+            
+            batch_count += 1
+            if batch_count >= 3:  # Just check first 3 batches for structure
+                break
+        
+        print(f"🔍 Debug - Class counts after {batch_count} batches: {class_counts}")
+        
+        # Prevent division by zero for missing classes
+        class_counts = torch.clamp(class_counts, min=1)
+        
+        # Compute weights (inverse frequency)
+        freq = class_counts / class_counts.sum()
+        weights = 1.0 / (freq + 1e-6)  # small epsilon for stability
+        weights = weights / weights.sum()  # normalize
+        
+        self._focal_loss_alpha = weights.to(_DEVICE)
+        self._loss_weights = weights.to(_DEVICE)
+        
+        print(f"📊 Fold class distribution: {class_counts.cpu().numpy()}")
+        print(f"⚖️  Computed focal loss weights: {weights.cpu().numpy()}")
 
     def smooth_l1(self, decoder_pred, decoder_gt):
         l1loss = nn.SmoothL1Loss(reduction='mean')
