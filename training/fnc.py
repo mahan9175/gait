@@ -79,82 +79,89 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
         # NEW: CSV logging setup
         self.csv_logger = CSVMetricsLogger(params['model_prefix'])
         
+        # Define number of classes (2 for your case)
+        self.num_classes = 2  # Changed from 4 to 2
+        
         if self.task == 'downstream':
             # We'll compute actual class weights per-fold during training
-            # Placeholder - will be updated with real fold distribution in train_model()
             self._loss_weights = None
             self._focal_loss_alpha = None  # Will be set per-fold
-            self._focal_loss_gamma = 3.0
+            self._focal_loss_gamma = 3.0  # Can adjust this for more/less focus on rare class
             
-            print(f'Focal loss initialized - weights will be computed per-fold with gamma={self._focal_loss_gamma}')
+            print(f'Focal loss initialized for {self.num_classes} classes - weights will be computed per-fold with gamma={self._focal_loss_gamma}')
         else:
             print('Using a standard CE loss for activity prediction.')
             
     def update_fold_weights(self, train_loader):
-        """Compute class weights from actual fold data distribution"""
+        """Compute class weights from actual fold data distribution for 2-class problem"""
         if self.task != 'downstream':
             return
         
-        class_counts = torch.zeros(4, dtype=torch.float32)
+        # Initialize counters for your 2 classes
+        class_counts = torch.zeros(self.num_classes, dtype=torch.float32)
         
-        # Debug: check the first batch structure
-        first_batch = next(iter(train_loader))
-        print(f"🔍 Debug - Batch type: {type(first_batch)}")
-        print(f"🔍 Debug - Batch keys: {first_batch.keys()}")
-        
-        # Check the structure of action_ids
-        if 'action_ids' in first_batch:
-            action_ids = first_batch['action_ids']
-            print(f"🔍 Debug - action_ids shape: {action_ids.shape}")
-            print(f"🔍 Debug - action_ids: {action_ids}")
-        
-        # Count actual samples in this fold
-        batch_count = 0
+        # Process ALL batches to get accurate class distribution
+        total_samples = 0
         for batch in train_loader:
-            # Extract labels from the batch dictionary
-            if 'action_ids' in batch:
-                labels = batch['action_ids']
+            if 'action_ids' not in batch:
+                continue
                 
-                # Ensure labels are 1D for bincount
-                if labels.dim() > 1:
-                    # If labels are 2D (batch_size, 1), squeeze to 1D
-                    labels = labels.squeeze()
-                elif labels.dim() == 0:
-                    # If it's a scalar, make it 1D
-                    labels = labels.unsqueeze(0)
-                
-                # Convert to long and ensure it's 1D
-                labels = labels.long().flatten()
-                
-                print(f"🔍 Debug - Processed labels shape: {labels.shape}")
-                print(f"🔍 Debug - Processed labels: {labels}")
-                
-                # Count classes
-                if labels.dim() == 1:
-                    class_counts += torch.bincount(labels, minlength=4)
-                else:
-                    print(f"❌ Error: Labels still not 1D, shape: {labels.shape}")
+            labels = batch['action_ids']
+            # Convert to long and flatten all dimensions
+            labels = labels.long().flatten()
             
-            batch_count += 1
-            if batch_count >= 2:  # Check first 2 batches
-                break
+            # Count classes in this batch
+            batch_counts = torch.bincount(labels, minlength=self.num_classes)
+            class_counts += batch_counts
+            total_samples += len(labels)
+
+        # Validate we have data
+        if total_samples == 0:
+            raise ValueError("No valid samples found in training data for class weight calculation")
         
-        print(f"🔍 Debug - Class counts after {batch_count} batches: {class_counts}")
+        # Calculate class distribution percentages
+        class_percentages = (class_counts / total_samples) * 100
+        
+        # Calculate imbalance ratio (larger class / smaller class)
+        min_count = min(class_counts[0], class_counts[1])
+        max_count = max(class_counts[0], class_counts[1])
+        imbalance_ratio = max_count / (min_count + 1e-6)  # Avoid division by zero
         
         # Prevent division by zero for missing classes
         class_counts = torch.clamp(class_counts, min=1)
         
-        # Compute weights (inverse frequency)
+        # Compute normalized inverse frequency weights
         freq = class_counts / class_counts.sum()
-        weights = 1.0 / (freq + 1e-6)  # small epsilon for stability
-        weights = weights / weights.sum()  # normalize
         
+        # For 2-class problems, we can use a more targeted approach:
+        # Option 1: Simple inverse frequency (original approach)
+        weights = 1.0 / (freq + 1e-6)
+        
+        # Option 2: Adjusted for extreme imbalance (uncomment if needed)
+        # weights = torch.sqrt(1.0 / (freq + 1e-6))
+        
+        # Option 3: Log-based weighting (uncomment if needed for severe imbalance)
+        # weights = 1.0 / torch.log(1.0 + freq * 10)
+        
+        weights = weights / weights.sum()  # Normalize weights
+        
+        # Update model weights
         self._focal_loss_alpha = weights.to(_DEVICE)
         self._loss_weights = weights.to(_DEVICE)
         
-        print(f"📊 Fold class distribution: {class_counts.cpu().numpy()}")
-        print(f"⚖️  Computed focal loss weights: {weights.cpu().numpy()}")
+        # Log informative results
+        print(f"📊 Class distribution: Class 0: {class_counts[0]:.0f} ({class_percentages[0]:.1f}%), Class 1: {class_counts[1]:.0f} ({class_percentages[1]:.1f}%)")
+        print(f"⚠️  Imbalance ratio: {imbalance_ratio:.1f}:1 (larger:smaller)")
+        print(f"⚖️  Computed focal loss weights: Class 0: {weights[0]:.4f}, Class 1: {weights[1]:.4f}")
+        
+        # Additional advice based on imbalance severity
+        if imbalance_ratio > 10:
+            print("💡 Note: Extreme imbalance detected. Consider:")
+            print("   - Increasing gamma value (currently 3.0) for stronger focus on minority class")
+            print("   - Using Option 2 or 3 weight calculation methods")
+            print("   - Adding class-specific augmentation for minority class")
 
+    # The rest of your methods remain the same...
     def smooth_l1(self, decoder_pred, decoder_gt):
         l1loss = nn.SmoothL1Loss(reduction='mean')
         return l1loss(decoder_pred, decoder_gt)
