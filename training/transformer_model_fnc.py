@@ -79,40 +79,73 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
     # NEW: CSV logging setup
     self.csv_logger = CSVMetricsLogger(params['model_prefix'])
     
+    # if self.task == 'downstream':
+    #     # The model expects 4 classes, so we need to provide weights for 4 classes
+    #     # Let's maintain the healthy/unhealthy ratio across 4 classes
+    #     healthy_count = 29
+    #     unhealthy_count = 11
+        
+    #     # Distribute the counts across 4 classes:
+    #     # Classes 0 and 1 represent healthy (class 0)
+    #     # Classes 2 and 3 represent unhealthy (class 1)
+    #     class_counts = torch.tensor([
+    #         healthy_count / 2,  # half of healthy to class 0
+    #         healthy_count / 2,  # half of healthy to class 1
+    #         unhealthy_count / 2,  # half of unhealthy to class 2
+    #         unhealthy_count / 2   # half of unhealthy to class 3
+    #     ])
+        
+    #     class_frequencies = class_counts.float() / class_counts.sum()
+    #     weights = 1.0 / class_frequencies
+    #     weights = weights / weights.sum()
+        
+    #     self._loss_weights = weights.to(_DEVICE)
+        
+    #     # REPLACED: CrossEntropyLoss with focal loss
+    #     # self._weighted_ce_loss = nn.CrossEntropyLoss(weight=self._loss_weights)
+        
+    #     # Use focal loss instead - note: we'll call the focal_loss function directly
+    #     # We store the weights and gamma parameter for use in the loss function
+    #     self._focal_loss_alpha = self._loss_weights
+    #     self._focal_loss_gamma = 2.0  # You can make this configurable via params if needed
+    #     print(f'Using focal loss with weights: {weights.cpu().numpy().tolist()} and gamma={self._focal_loss_gamma}')
+    # else:
+    #     print('Using a standard CE loss for activity prediction.')
     if self.task == 'downstream':
-        # The model expects 4 classes, so we need to provide weights for 4 classes
-        # Let's maintain the healthy/unhealthy ratio across 4 classes
-        healthy_count = 29
-        unhealthy_count = 11
+        # We'll compute actual class weights per-fold during training
+        # Placeholder - will be updated with real fold distribution in train_model()
+        self._loss_weights = None
+        self._focal_loss_alpha = None  # Will be set per-fold
+        self._focal_loss_gamma = 2.0
         
-        # Distribute the counts across 4 classes:
-        # Classes 0 and 1 represent healthy (class 0)
-        # Classes 2 and 3 represent unhealthy (class 1)
-        class_counts = torch.tensor([
-            healthy_count / 2,  # half of healthy to class 0
-            healthy_count / 2,  # half of healthy to class 1
-            unhealthy_count / 2,  # half of unhealthy to class 2
-            unhealthy_count / 2   # half of unhealthy to class 3
-        ])
-        
-        class_frequencies = class_counts.float() / class_counts.sum()
-        weights = 1.0 / class_frequencies
-        weights = weights / weights.sum()
-        
-        self._loss_weights = weights.to(_DEVICE)
-        
-        # REPLACED: CrossEntropyLoss with focal loss
-        # self._weighted_ce_loss = nn.CrossEntropyLoss(weight=self._loss_weights)
-        
-        # Use focal loss instead - note: we'll call the focal_loss function directly
-        # We store the weights and gamma parameter for use in the loss function
-        self._focal_loss_alpha = self._loss_weights
-        self._focal_loss_gamma = 2.0  # You can make this configurable via params if needed
-        print(f'Using focal loss with weights: {weights.cpu().numpy().tolist()} and gamma={self._focal_loss_gamma}')
+        print(f'Focal loss initialized - weights will be computed per-fold with gamma={self._focal_loss_gamma}')
     else:
-        print('Using a standard CE loss for activity prediction.')
-        
-  def smooth_l1(self, decoder_pred, decoder_gt):
+        print('Using a standard CE loss for activity prediction.')        
+def update_fold_weights(self, train_loader):
+    """Compute class weights from actual fold data distribution"""
+    if self.task != 'downstream':
+        return
+    
+    class_counts = torch.zeros(4, dtype=torch.float32)
+    
+    # Count actual samples in this fold
+    for _, labels in train_loader:
+        class_counts += torch.bincount(labels.long(), minlength=4)
+    
+    # Prevent division by zero for missing classes
+    class_counts = torch.clamp(class_counts, min=1)
+    
+    # Compute weights (inverse frequency)
+    freq = class_counts / class_counts.sum()
+    weights = 1.0 / (freq + 1e-6)  # small epsilon for stability
+    weights = weights / weights.sum()  # normalize
+    
+    self._focal_loss_alpha = weights.to(_DEVICE)
+    self._loss_weights = weights.to(_DEVICE)
+    
+    print(f"📊 Fold class distribution: {class_counts.cpu().numpy()}")
+    print(f"⚖️  Computed focal loss weights: {weights.cpu().numpy()}")  
+def smooth_l1(self, decoder_pred, decoder_gt):
     l1loss = nn.SmoothL1Loss(reduction='mean')
     return l1loss(decoder_pred, decoder_gt)
 
@@ -704,6 +737,10 @@ if __name__ == '__main__':
         eval_dataset_fn, 
         pose_encoder_fn, pose_decoder_fn
     )
+    
+    # NEW: Update model with actual fold class distribution
+    train_loader = train_dataset_fn()  # Create the train loader
+    model_fn.update_fold_weights(train_loader)  # Compute per-fold weights
     
     # NEW: Set current fold for CSV logging
     model_fn.csv_logger.current_fold = fold
