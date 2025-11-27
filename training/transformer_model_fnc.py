@@ -60,7 +60,7 @@ _DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 _WEIGHT_DECAY = 0.00001
 _NSEEDS = 8
 
-def focal_loss(logits, targets, alpha=None, gamma=2):
+def focal_loss(logits, targets, alpha=None, gamma=3):
     ce = F.cross_entropy(logits, targets, weight=alpha, reduction='none')
     pt = torch.exp(-ce)
     return ((1-pt)**gamma * ce).mean()
