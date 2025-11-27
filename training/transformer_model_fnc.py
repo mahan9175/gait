@@ -65,201 +65,170 @@ def focal_loss(logits, targets, alpha=None, gamma=3):
     pt = torch.exp(-ce)
     return ((1-pt)**gamma * ce).mean()
 class POTRModelFn(seq2seq_model_fn.ModelFn):
-  def __init__(self,
-               params,
-               train_dataset_fn,
-               eval_dataset_fn,
-               pose_encoder_fn=None,
-               pose_decoder_fn=None):
-    super(POTRModelFn, self).__init__(
-      params, train_dataset_fn, eval_dataset_fn, pose_encoder_fn, pose_decoder_fn)
-    self._loss_fn = self.layerwise_loss_fn
-    self.task = params['task']
-    
-    # NEW: CSV logging setup
-    self.csv_logger = CSVMetricsLogger(params['model_prefix'])
-    
-    # if self.task == 'downstream':
-    #     # The model expects 4 classes, so we need to provide weights for 4 classes
-    #     # Let's maintain the healthy/unhealthy ratio across 4 classes
-    #     healthy_count = 29
-    #     unhealthy_count = 11
+    def __init__(self,
+                 params,
+                 train_dataset_fn,
+                 eval_dataset_fn,
+                 pose_encoder_fn=None,
+                 pose_decoder_fn=None):
+        super(POTRModelFn, self).__init__(
+            params, train_dataset_fn, eval_dataset_fn, pose_encoder_fn, pose_decoder_fn)
+        self._loss_fn = self.layerwise_loss_fn
+        self.task = params['task']
         
-    #     # Distribute the counts across 4 classes:
-    #     # Classes 0 and 1 represent healthy (class 0)
-    #     # Classes 2 and 3 represent unhealthy (class 1)
-    #     class_counts = torch.tensor([
-    #         healthy_count / 2,  # half of healthy to class 0
-    #         healthy_count / 2,  # half of healthy to class 1
-    #         unhealthy_count / 2,  # half of unhealthy to class 2
-    #         unhealthy_count / 2   # half of unhealthy to class 3
-    #     ])
+        # NEW: CSV logging setup
+        self.csv_logger = CSVMetricsLogger(params['model_prefix'])
         
-    #     class_frequencies = class_counts.float() / class_counts.sum()
-    #     weights = 1.0 / class_frequencies
-    #     weights = weights / weights.sum()
+        if self.task == 'downstream':
+            # We'll compute actual class weights per-fold during training
+            # Placeholder - will be updated with real fold distribution in train_model()
+            self._loss_weights = None
+            self._focal_loss_alpha = None  # Will be set per-fold
+            self._focal_loss_gamma = 2.0
+            
+            print(f'Focal loss initialized - weights will be computed per-fold with gamma={self._focal_loss_gamma}')
+        else:
+            print('Using a standard CE loss for activity prediction.')
+            
+    def update_fold_weights(self, train_loader):
+        """Compute class weights from actual fold data distribution"""
+        if self.task != 'downstream':
+            return
         
-    #     self._loss_weights = weights.to(_DEVICE)
+        class_counts = torch.zeros(4, dtype=torch.float32)
         
-    #     # REPLACED: CrossEntropyLoss with focal loss
-    #     # self._weighted_ce_loss = nn.CrossEntropyLoss(weight=self._loss_weights)
+        # Count actual samples in this fold
+        for _, labels in train_loader:
+            class_counts += torch.bincount(labels.long(), minlength=4)
         
-    #     # Use focal loss instead - note: we'll call the focal_loss function directly
-    #     # We store the weights and gamma parameter for use in the loss function
-    #     self._focal_loss_alpha = self._loss_weights
-    #     self._focal_loss_gamma = 2.0  # You can make this configurable via params if needed
-    #     print(f'Using focal loss with weights: {weights.cpu().numpy().tolist()} and gamma={self._focal_loss_gamma}')
-    # else:
-    #     print('Using a standard CE loss for activity prediction.')
-    if self.task == 'downstream':
-        # We'll compute actual class weights per-fold during training
-        # Placeholder - will be updated with real fold distribution in train_model()
-        self._loss_weights = None
-        self._focal_loss_alpha = None  # Will be set per-fold
-        self._focal_loss_gamma = 2.0
+        # Prevent division by zero for missing classes
+        class_counts = torch.clamp(class_counts, min=1)
         
-        print(f'Focal loss initialized - weights will be computed per-fold with gamma={self._focal_loss_gamma}')
-    else:
-        print('Using a standard CE loss for activity prediction.')        
-def update_fold_weights(self, train_loader):
-    """Compute class weights from actual fold data distribution"""
-    if self.task != 'downstream':
-        return
-    
-    class_counts = torch.zeros(4, dtype=torch.float32)
-    
-    # Count actual samples in this fold
-    for _, labels in train_loader:
-        class_counts += torch.bincount(labels.long(), minlength=4)
-    
-    # Prevent division by zero for missing classes
-    class_counts = torch.clamp(class_counts, min=1)
-    
-    # Compute weights (inverse frequency)
-    freq = class_counts / class_counts.sum()
-    weights = 1.0 / (freq + 1e-6)  # small epsilon for stability
-    weights = weights / weights.sum()  # normalize
-    
-    self._focal_loss_alpha = weights.to(_DEVICE)
-    self._loss_weights = weights.to(_DEVICE)
-    
-    print(f"📊 Fold class distribution: {class_counts.cpu().numpy()}")
-    print(f"⚖️  Computed focal loss weights: {weights.cpu().numpy()}")  
-def smooth_l1(self, decoder_pred, decoder_gt):
-    l1loss = nn.SmoothL1Loss(reduction='mean')
-    return l1loss(decoder_pred, decoder_gt)
-
-  def loss_l1(self, decoder_pred, decoder_gt):
-    return nn.L1Loss(reduction='mean')(decoder_pred, decoder_gt)
-
-  def loss_activity(self, logits, class_gt):                                     
-    """Computes entropy loss from logits between predictions and class."""
-    class_gt = class_gt.long()  # Convert to long type
-    if self.task == 'downstream':
-        # REPLACED: Use focal loss instead of cross entropy
-        # return self._weighted_ce_loss(logits, class_gt)
-        return focal_loss(logits, class_gt, alpha=self._focal_loss_alpha, gamma=self._focal_loss_gamma)
-    else:
-        return nn.functional.cross_entropy(logits, class_gt, reduction='mean')
-
-  def compute_class_loss(self, class_logits, class_gt):
-    """Computes the class loss for each of the decoder layers predictions or memory."""
-    class_loss = 0.0
-    for l in range(len(class_logits)):
-      class_loss += self.loss_activity(class_logits[l], class_gt)
-
-    return class_loss/len(class_logits)
-
-  def select_loss_fn(self):
-    if self._params['loss_fn'] == 'mse':
-      return self.loss_mse
-    elif self._params['loss_fn'] == 'smoothl1':
-      return self.smooth_l1
-    elif self._params['loss_fn'] == 'l1':
-      return self.loss_l1
-    else:
-      raise ValueError('Unknown loss name {}.'.format(self._params['loss_fn']))
-
-  def layerwise_loss_fn(self, decoder_pred, decoder_gt, class_logits=None, class_gt=None):
-    """Computes layerwise loss between predictions and ground truth."""
-    pose_loss = 0.0
-    loss_fn = self.select_loss_fn()
-
-    for l in range(len(decoder_pred)):
-      pose_loss += loss_fn(decoder_pred[l], decoder_gt)
-
-    pose_loss = pose_loss/len(decoder_pred)
-    if class_logits is not None:
-      return pose_loss, self.compute_class_loss(class_logits, class_gt)
-
-    return pose_loss, None
-
-  def init_model(self, pose_encoder_fn=None, pose_decoder_fn=None):
-    self._model = PoseTransformer.model_factory(
-        self._params, 
-        pose_encoder_fn, 
-        pose_decoder_fn
-    )
-
-  def select_optimizer(self):
-    # For imbalanced datasets, consider these optimizers:
-    
-    # Option 1: AdamW with adjusted parameters (recommended)
-    # optimizer = optim.AdamW(
-    #     self._model.parameters(), 
-    #     lr=self._params['learning_rate'],
-    #     betas=(0.9, 0.999),
-    #     weight_decay=_WEIGHT_DECAY
-    # )
-    
-    # Option 2: SGD with momentum (sometimes better for imbalanced data)
-    # optimizer = optim.SGD(
-    #     self._model.parameters(),
-    #     lr=self._params['learning_rate'],
-    #     momentum=0.9,
-    #     weight_decay=_WEIGHT_DECAY,
-    #     nesterov=True
-    # )
-    
-    # Option 3: Adam with AMSGrad (more stable for imbalanced data)
-    optimizer = optim.Adam(
-        self._model.parameters(),
-        lr=self._params['learning_rate'],
-        betas=(0.9, 0.999),
-        weight_decay=_WEIGHT_DECAY,
-        amsgrad=True
-    )
-    
-    return optimizer
-
-  # NEW: Override train method to add CSV logging
-  def train(self):
-    """Override train method to add CSV logging for epochs."""
-    start_time = time.time()
-    
-    # Call parent train method
-    if self._params['task'] == 'downstream':
-        predictions, gts, pred_probs = super().train()
+        # Compute weights (inverse frequency)
+        freq = class_counts / class_counts.sum()
+        weights = 1.0 / (freq + 1e-6)  # small epsilon for stability
+        weights = weights / weights.sum()  # normalize
         
-        # Log final fold metrics
-        if hasattr(self, 'current_fold'):
-            self.csv_logger.log_fold_metrics(self.current_fold, predictions, gts)
+        self._focal_loss_alpha = weights.to(_DEVICE)
+        self._loss_weights = weights.to(_DEVICE)
         
-        return predictions, gts, pred_probs
-    else:
-        super().train()
-        return None, None, None
+        print(f"📊 Fold class distribution: {class_counts.cpu().numpy()}")
+        print(f"⚖️  Computed focal loss weights: {weights.cpu().numpy()}")
 
-  # NEW: Method to log epoch metrics
-  def log_epoch_metrics(self, epoch, train_loss, eval_loss, train_pose_loss=None, 
-                       eval_pose_loss=None, train_activity_loss=None, eval_activity_loss=None,
-                       learning_rate=None):
-    """Log metrics for each epoch to CSV."""
-    self.csv_logger.log_epoch_metrics(
-        epoch, train_loss, eval_loss, train_pose_loss, eval_pose_loss,
-        train_activity_loss, eval_activity_loss, learning_rate
-    )
+    def smooth_l1(self, decoder_pred, decoder_gt):
+        l1loss = nn.SmoothL1Loss(reduction='mean')
+        return l1loss(decoder_pred, decoder_gt)
 
+    def loss_l1(self, decoder_pred, decoder_gt):
+        return nn.L1Loss(reduction='mean')(decoder_pred, decoder_gt)
+
+    def loss_activity(self, logits, class_gt):                                     
+        """Computes entropy loss from logits between predictions and class."""
+        class_gt = class_gt.long()  # Convert to long type
+        if self.task == 'downstream':
+            # REPLACED: Use focal loss instead of cross entropy
+            # return self._weighted_ce_loss(logits, class_gt)
+            return focal_loss(logits, class_gt, alpha=self._focal_loss_alpha, gamma=self._focal_loss_gamma)
+        else:
+            return nn.functional.cross_entropy(logits, class_gt, reduction='mean')
+
+    def compute_class_loss(self, class_logits, class_gt):
+        """Computes the class loss for each of the decoder layers predictions or memory."""
+        class_loss = 0.0
+        for l in range(len(class_logits)):
+            class_loss += self.loss_activity(class_logits[l], class_gt)
+
+        return class_loss/len(class_logits)
+
+    def select_loss_fn(self):
+        if self._params['loss_fn'] == 'mse':
+            return self.loss_mse
+        elif self._params['loss_fn'] == 'smoothl1':
+            return self.smooth_l1
+        elif self._params['loss_fn'] == 'l1':
+            return self.loss_l1
+        else:
+            raise ValueError('Unknown loss name {}.'.format(self._params['loss_fn']))
+
+    def layerwise_loss_fn(self, decoder_pred, decoder_gt, class_logits=None, class_gt=None):
+        """Computes layerwise loss between predictions and ground truth."""
+        pose_loss = 0.0
+        loss_fn = self.select_loss_fn()
+
+        for l in range(len(decoder_pred)):
+            pose_loss += loss_fn(decoder_pred[l], decoder_gt)
+
+        pose_loss = pose_loss/len(decoder_pred)
+        if class_logits is not None:
+            return pose_loss, self.compute_class_loss(class_logits, class_gt)
+
+        return pose_loss, None
+
+    def init_model(self, pose_encoder_fn=None, pose_decoder_fn=None):
+        self._model = PoseTransformer.model_factory(
+            self._params, 
+            pose_encoder_fn, 
+            pose_decoder_fn
+        )
+
+    def select_optimizer(self):
+        # For imbalanced datasets, consider these optimizers:
+        
+        # Option 1: AdamW with adjusted parameters (recommended)
+        # optimizer = optim.AdamW(
+        #     self._model.parameters(), 
+        #     lr=self._params['learning_rate'],
+        #     betas=(0.9, 0.999),
+        #     weight_decay=_WEIGHT_DECAY
+        # )
+        
+        # Option 2: SGD with momentum (sometimes better for imbalanced data)
+        # optimizer = optim.SGD(
+        #     self._model.parameters(),
+        #     lr=self._params['learning_rate'],
+        #     momentum=0.9,
+        #     weight_decay=_WEIGHT_DECAY,
+        #     nesterov=True
+        # )
+        
+        # Option 3: Adam with AMSGrad (more stable for imbalanced data)
+        optimizer = optim.Adam(
+            self._model.parameters(),
+            lr=self._params['learning_rate'],
+            betas=(0.9, 0.999),
+            weight_decay=_WEIGHT_DECAY,
+            amsgrad=True
+        )
+        
+        return optimizer
+
+    # NEW: Override train method to add CSV logging
+    def train(self):
+        """Override train method to add CSV logging for epochs."""
+        start_time = time.time()
+        
+        # Call parent train method
+        if self._params['task'] == 'downstream':
+            predictions, gts, pred_probs = super().train()
+            
+            # Log final fold metrics
+            if hasattr(self, 'current_fold'):
+                self.csv_logger.log_fold_metrics(self.current_fold, predictions, gts)
+            
+            return predictions, gts, pred_probs
+        else:
+            super().train()
+            return None, None, None
+
+    # NEW: Method to log epoch metrics
+    def log_epoch_metrics(self, epoch, train_loss, eval_loss, train_pose_loss=None, 
+                         eval_pose_loss=None, train_activity_loss=None, eval_activity_loss=None,
+                         learning_rate=None):
+        """Log metrics for each epoch to CSV."""
+        self.csv_logger.log_epoch_metrics(
+            epoch, train_loss, eval_loss, train_pose_loss, eval_pose_loss,
+            train_activity_loss, eval_activity_loss, learning_rate
+        )
 
 class CSVMetricsLogger:
     """CSV logger for tracking metrics during training across epochs and folds."""
