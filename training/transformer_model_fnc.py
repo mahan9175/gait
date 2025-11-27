@@ -92,69 +92,69 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
             print('Using a standard CE loss for activity prediction.')
             
     def update_fold_weights(self, train_loader):
-    """Compute class weights from actual fold data distribution"""
-    if self.task != 'downstream':
-        return
-    
-    class_counts = torch.zeros(4, dtype=torch.float32)
-    
-    # Debug: check the first batch structure
-    first_batch = next(iter(train_loader))
-    print(f"🔍 Debug - Batch type: {type(first_batch)}")
-    print(f"🔍 Debug - Batch keys: {first_batch.keys()}")
-    
-    # Check the structure of action_ids
-    if 'action_ids' in first_batch:
-        action_ids = first_batch['action_ids']
-        print(f"🔍 Debug - action_ids shape: {action_ids.shape}")
-        print(f"🔍 Debug - action_ids: {action_ids}")
-    
-    # Count actual samples in this fold
-    batch_count = 0
-    for batch in train_loader:
-        # Extract labels from the batch dictionary
-        if 'action_ids' in batch:
-            labels = batch['action_ids']
-            
-            # Ensure labels are 1D for bincount
-            if labels.dim() > 1:
-                # If labels are 2D (batch_size, 1), squeeze to 1D
-                labels = labels.squeeze()
-            elif labels.dim() == 0:
-                # If it's a scalar, make it 1D
-                labels = labels.unsqueeze(0)
-            
-            # Convert to long and ensure it's 1D
-            labels = labels.long().flatten()
-            
-            print(f"🔍 Debug - Processed labels shape: {labels.shape}")
-            print(f"🔍 Debug - Processed labels: {labels}")
-            
-            # Count classes
-            if labels.dim() == 1:
-                class_counts += torch.bincount(labels, minlength=4)
-            else:
-                print(f"❌ Error: Labels still not 1D, shape: {labels.shape}")
+        """Compute class weights from actual fold data distribution"""
+        if self.task != 'downstream':
+            return
         
-        batch_count += 1
-        if batch_count >= 2:  # Check first 2 batches
-            break
-    
-    print(f"🔍 Debug - Class counts after {batch_count} batches: {class_counts}")
-    
-    # Prevent division by zero for missing classes
-    class_counts = torch.clamp(class_counts, min=1)
-    
-    # Compute weights (inverse frequency)
-    freq = class_counts / class_counts.sum()
-    weights = 1.0 / (freq + 1e-6)  # small epsilon for stability
-    weights = weights / weights.sum()  # normalize
-    
-    self._focal_loss_alpha = weights.to(_DEVICE)
-    self._loss_weights = weights.to(_DEVICE)
-    
-    print(f"📊 Fold class distribution: {class_counts.cpu().numpy()}")
-    print(f"⚖️  Computed focal loss weights: {weights.cpu().numpy()}")
+        class_counts = torch.zeros(4, dtype=torch.float32)
+        
+        # Debug: check the first batch structure
+        first_batch = next(iter(train_loader))
+        print(f"🔍 Debug - Batch type: {type(first_batch)}")
+        print(f"🔍 Debug - Batch keys: {first_batch.keys()}")
+        
+        # Check the structure of action_ids
+        if 'action_ids' in first_batch:
+            action_ids = first_batch['action_ids']
+            print(f"🔍 Debug - action_ids shape: {action_ids.shape}")
+            print(f"🔍 Debug - action_ids: {action_ids}")
+        
+        # Count actual samples in this fold
+        batch_count = 0
+        for batch in train_loader:
+            # Extract labels from the batch dictionary
+            if 'action_ids' in batch:
+                labels = batch['action_ids']
+                
+                # Ensure labels are 1D for bincount
+                if labels.dim() > 1:
+                    # If labels are 2D (batch_size, 1), squeeze to 1D
+                    labels = labels.squeeze()
+                elif labels.dim() == 0:
+                    # If it's a scalar, make it 1D
+                    labels = labels.unsqueeze(0)
+                
+                # Convert to long and ensure it's 1D
+                labels = labels.long().flatten()
+                
+                print(f"🔍 Debug - Processed labels shape: {labels.shape}")
+                print(f"🔍 Debug - Processed labels: {labels}")
+                
+                # Count classes
+                if labels.dim() == 1:
+                    class_counts += torch.bincount(labels, minlength=4)
+                else:
+                    print(f"❌ Error: Labels still not 1D, shape: {labels.shape}")
+            
+            batch_count += 1
+            if batch_count >= 2:  # Check first 2 batches
+                break
+        
+        print(f"🔍 Debug - Class counts after {batch_count} batches: {class_counts}")
+        
+        # Prevent division by zero for missing classes
+        class_counts = torch.clamp(class_counts, min=1)
+        
+        # Compute weights (inverse frequency)
+        freq = class_counts / class_counts.sum()
+        weights = 1.0 / (freq + 1e-6)  # small epsilon for stability
+        weights = weights / weights.sum()  # normalize
+        
+        self._focal_loss_alpha = weights.to(_DEVICE)
+        self._loss_weights = weights.to(_DEVICE)
+        
+        print(f"📊 Fold class distribution: {class_counts.cpu().numpy()}")
+        print(f"⚖️  Computed focal loss weights: {weights.cpu().numpy()}")
 
     def smooth_l1(self, decoder_pred, decoder_gt):
         l1loss = nn.SmoothL1Loss(reduction='mean')
