@@ -79,25 +79,26 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
         # NEW: CSV logging setup
         self.csv_logger = CSVMetricsLogger(params['model_prefix'])
         
-        # Define number of classes (2 for your case)
-        self.num_classes = 2  # Changed from 4 to 2
+        # CRITICAL: Set correct number of classes based on your actual problem
+        # This should match what's in your model configuration
+        self.num_classes = 2  # Set to 2 for your binary classification
         
         if self.task == 'downstream':
             # We'll compute actual class weights per-fold during training
             self._loss_weights = None
             self._focal_loss_alpha = None  # Will be set per-fold
-            self._focal_loss_gamma = 3.0  # Can adjust this for more/less focus on rare class
+            self._focal_loss_gamma = 3.0
             
             print(f'Focal loss initialized for {self.num_classes} classes - weights will be computed per-fold with gamma={self._focal_loss_gamma}')
         else:
             print('Using a standard CE loss for activity prediction.')
             
     def update_fold_weights(self, train_loader):
-        """Compute class weights from actual fold data distribution for 2-class problem"""
+        """Compute class weights from actual fold data distribution"""
         if self.task != 'downstream':
             return
         
-        # Initialize counters for your 2 classes
+        # Initialize counters for the correct number of classes
         class_counts = torch.zeros(self.num_classes, dtype=torch.float32)
         
         # Process ALL batches to get accurate class distribution
@@ -110,10 +111,17 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
             # Convert to long and flatten all dimensions
             labels = labels.long().flatten()
             
+            # Filter out any invalid class indices
+            valid_mask = (labels >= 0) & (labels < self.num_classes)
+            valid_labels = labels[valid_mask]
+            
+            if len(valid_labels) == 0:
+                continue
+                
             # Count classes in this batch
-            batch_counts = torch.bincount(labels, minlength=self.num_classes)
+            batch_counts = torch.bincount(valid_labels, minlength=self.num_classes)
             class_counts += batch_counts
-            total_samples += len(labels)
+            total_samples += len(valid_labels)
 
         # Validate we have data
         if total_samples == 0:
@@ -125,24 +133,14 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
         # Calculate imbalance ratio (larger class / smaller class)
         min_count = min(class_counts[0], class_counts[1])
         max_count = max(class_counts[0], class_counts[1])
-        imbalance_ratio = max_count / (min_count + 1e-6)  # Avoid division by zero
+        imbalance_ratio = max_count / (min_count + 1e-6)
         
         # Prevent division by zero for missing classes
         class_counts = torch.clamp(class_counts, min=1)
         
         # Compute normalized inverse frequency weights
         freq = class_counts / class_counts.sum()
-        
-        # For 2-class problems, we can use a more targeted approach:
-        # Option 1: Simple inverse frequency (original approach)
         weights = 1.0 / (freq + 1e-6)
-        
-        # Option 2: Adjusted for extreme imbalance (uncomment if needed)
-        # weights = torch.sqrt(1.0 / (freq + 1e-6))
-        
-        # Option 3: Log-based weighting (uncomment if needed for severe imbalance)
-        # weights = 1.0 / torch.log(1.0 + freq * 10)
-        
         weights = weights / weights.sum()  # Normalize weights
         
         # Update model weights
@@ -153,13 +151,7 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
         print(f"📊 Class distribution: Class 0: {class_counts[0]:.0f} ({class_percentages[0]:.1f}%), Class 1: {class_counts[1]:.0f} ({class_percentages[1]:.1f}%)")
         print(f"⚠️  Imbalance ratio: {imbalance_ratio:.1f}:1 (larger:smaller)")
         print(f"⚖️  Computed focal loss weights: Class 0: {weights[0]:.4f}, Class 1: {weights[1]:.4f}")
-        
-        # Additional advice based on imbalance severity
-        if imbalance_ratio > 10:
-            print("💡 Note: Extreme imbalance detected. Consider:")
-            print("   - Increasing gamma value (currently 3.0) for stronger focus on minority class")
-            print("   - Using Option 2 or 3 weight calculation methods")
-            print("   - Adding class-specific augmentation for minority class")
+
 
     # The rest of your methods remain the same...
     def smooth_l1(self, decoder_pred, decoder_gt):
@@ -169,15 +161,6 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
     def loss_l1(self, decoder_pred, decoder_gt):
         return nn.L1Loss(reduction='mean')(decoder_pred, decoder_gt)
 
-    def loss_activity(self, logits, class_gt):                                     
-        """Computes entropy loss from logits between predictions and class."""
-        class_gt = class_gt.long()  # Convert to long type
-        if self.task == 'downstream':
-            # REPLACED: Use focal loss instead of cross entropy
-            # return self._weighted_ce_loss(logits, class_gt)
-            return focal_loss(logits, class_gt, alpha=self._focal_loss_alpha, gamma=self._focal_loss_gamma)
-        else:
-            return nn.functional.cross_entropy(logits, class_gt, reduction='mean')
 
     def compute_class_loss(self, class_logits, class_gt):
         """Computes the class loss for each of the decoder layers predictions or memory."""
@@ -186,7 +169,32 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
             class_loss += self.loss_activity(class_logits[l], class_gt)
 
         return class_loss/len(class_logits)
-
+    def loss_activity(self, logits, class_gt):                                     
+        """Computes entropy loss from logits between predictions and class."""
+        class_gt = class_gt.long()
+        
+        # CRITICAL: Ensure class_gt values are within valid range
+        class_gt = torch.clamp(class_gt, 0, self.num_classes-1)
+        
+        if self.task == 'downstream':
+            # Create weight tensor with correct number of classes
+            if self._focal_loss_alpha is not None:
+                # Make sure weight tensor has the correct size
+                if len(self._focal_loss_alpha) != self.num_classes:
+                    # This is the critical fix - ensure weights match expected class count
+                    print(f"⚠️ Weight tensor size mismatch: expected {self.num_classes} classes, got {len(self._focal_loss_alpha)}")
+                    # Recreate weights with correct size
+                    weights = torch.ones(self.num_classes, device=_DEVICE)
+                    actual_classes = min(len(self._focal_loss_alpha), self.num_classes)
+                    weights[:actual_classes] = self._focal_loss_alpha[:actual_classes]
+                    weights = weights / weights.sum()
+                    self._focal_loss_alpha = weights
+                    print(f"✅ Fixed weight tensor to match {self.num_classes} classes")
+                
+                return focal_loss(logits, class_gt, alpha=self._focal_loss_alpha, gamma=self._focal_loss_gamma)
+            return focal_loss(logits, class_gt, gamma=self._focal_loss_gamma)
+        else:
+            return nn.functional.cross_entropy(logits, class_gt, reduction='mean')
     def select_loss_fn(self):
         if self._params['loss_fn'] == 'mse':
             return self.loss_mse
