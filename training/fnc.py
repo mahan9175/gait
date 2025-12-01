@@ -671,8 +671,7 @@ if __name__ == '__main__':
   parser.add_argument('--task', type=str, default='downstream', choices=['pretext', 'downstream'])
   parser.add_argument('--downstream_strategy', default='both_then_class', choices=['both', 'class', 'both_then_class'])
   # pose transformers related parameters
-  # In main() section (line 497), ensure this parameter exists:
-  parser.add_argument('--num_classes', type=int, default=4)  # Ensure this is set to 4
+
   parser.add_argument('--model_dim', type=int, default=256)
   parser.add_argument('--num_encoder_layers', type=int, default=4)
   parser.add_argument('--num_decoder_layers', type=int, default=4)
