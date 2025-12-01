@@ -81,7 +81,7 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
         
         # CRITICAL: Set correct number of classes based on your actual problem
         # This should match what's in your model configuration
-        self.num_classes = 2  # Set to 2 for your binary classification
+        self.num_classes = params.get('num_classes', 4)  # Set to 2 for your binary classification
         
         if self.task == 'downstream':
             # We'll compute actual class weights per-fold during training
@@ -131,10 +131,9 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
         class_percentages = (class_counts / total_samples) * 100
         
         # Calculate imbalance ratio (larger class / smaller class)
-        min_count = min(class_counts[0], class_counts[1])
-        max_count = max(class_counts[0], class_counts[1])
+        min_count = torch.min(class_counts)
+        max_count = torch.max(class_counts)
         imbalance_ratio = max_count / (min_count + 1e-6)
-        
         # Prevent division by zero for missing classes
         class_counts = torch.clamp(class_counts, min=1)
         
@@ -364,7 +363,7 @@ class CSVMetricsLogger:
         
         # Calculate metrics
         accuracy = accuracy_score(true_labels, predictions)
-        precision_macro = precision_score(true_labels, predictions, average='macro', zero_division=0)
+        precision_macro = precision_score(y_true, y_pred, average='macro', zero_division=0, labels=range(self.model_fn.num_classes) if hasattr(self.model_fn, 'num_classes') else None)
         recall_macro = recall_score(true_labels, predictions, average='macro', zero_division=0)
         f1_macro = f1_score(true_labels, predictions, average='macro', zero_division=0)
         precision_weighted = precision_score(true_labels, predictions, average='weighted', zero_division=0)
@@ -586,8 +585,9 @@ def print_detailed_report(y_true, y_pred, num_classes):
             print(f"     {i}  " + " ".join([f"{val:6d}" for val in cm[i]]))
     
     # Class distribution
-    true_dist = np.bincount(y_true, minlength=actual_num_classes)  # Use actual_num_classes here
-    pred_dist = np.bincount(y_pred, minlength=actual_num_classes)  # Use actual_num_classes here
+    actual_num_classes = len(np.unique(np.concatenate([y_true, y_pred])))
+    true_dist = np.bincount(y_true, minlength=actual_num_classes)
+    pred_dist = np.bincount(y_pred, minlength=actual_num_classes)
     
     print(f"\nClass Distribution:")
     print(f"  True: {dict(enumerate(true_dist))}")
@@ -671,6 +671,8 @@ if __name__ == '__main__':
   parser.add_argument('--task', type=str, default='downstream', choices=['pretext', 'downstream'])
   parser.add_argument('--downstream_strategy', default='both_then_class', choices=['both', 'class', 'both_then_class'])
   # pose transformers related parameters
+  # In main() section (line 497), ensure this parameter exists:
+  parser.add_argument('--num_classes', type=int, default=4)  # Ensure this is set to 4
   parser.add_argument('--model_dim', type=int, default=256)
   parser.add_argument('--num_encoder_layers', type=int, default=4)
   parser.add_argument('--num_decoder_layers', type=int, default=4)
