@@ -16,9 +16,8 @@ _NMAJOR_JOINTS = len(_MAJOR_JOINTS)
 _MIN_STD = 1e-4
 _SPINE_ROOT = 0  # after only taking major joints (ie index in _MAJOR_JOINTS)
 
-# Add this configuration variable at the top
-# Set to 2 for 2D data (x,y), or 3 for 3D data (x,y,z)
-_JOINT_DIMENSIONS = 2  # CHANGE THIS TO 2 FOR YOUR 2D DATA
+# CRITICAL CHANGE: Set to 3 to match pre-trained model's expected dimension
+_JOINT_DIMENSIONS = 3  # Was 2 - now 3 to match checkpoint dimensions
 
 def collate_fn(batch):
     """Collate function for data loaders."""
@@ -65,8 +64,8 @@ class GaitJointsDataset(torch.utils.data.Dataset):
         self.Y = Y
         self._action_str = ['none', 'mild', 'moderate', 'severe']
 
-        # Update for 2D data
-        self._pose_dim = _JOINT_DIMENSIONS * _NMAJOR_JOINTS  # 2 × 17 = 34
+        # Now using 3D dimensions (51 features)
+        self._pose_dim = _JOINT_DIMENSIONS * _NMAJOR_JOINTS  # 3 × 17 = 51
         self._data_dim = self._pose_dim
         
         # Print shape info for debugging
@@ -92,6 +91,11 @@ class GaitJointsDataset(torch.utils.data.Dataset):
         for i in range(len(T['pose'])): 
             total_num_clips += 1
             p = np.copy(T['pose'][i])
+            # CRITICAL: Convert 2D poses (N,17,2) to 3D (N,17,3) if needed
+            if p.shape[-1] == 2:  # Only 2 dimensions
+                p_3d = np.zeros((p.shape[0], p.shape[1], 3), dtype=p.dtype)
+                p_3d[..., :2] = p  # Copy x,y coordinates
+                p = p_3d
             y_label_index = T['label'][i]
             label = y_label_index
             X_1.append(p)
@@ -108,16 +112,23 @@ class GaitJointsDataset(torch.utils.data.Dataset):
 
     def _get_item_train(self, idx):
         """Get item for the training mode."""
-        x = self.X_1[idx]  # Shape: [frames, 17, 2] or [frames, 17, 3]
+        x = self.X_1[idx]  # Shape: [frames, 17, 3] after padding
+        
+        # CRITICAL: Ensure 3D format even if stored as 2D
+        if x.shape[-1] == 2:  # Safety check
+            x_padded = np.zeros((x.shape[0], x.shape[1], 3), dtype=x.dtype)
+            x_padded[..., :2] = x
+            x = x_padded
+
         y = self.Y[idx]
 
         action_id = y
         source_seq_len = self._params['source_seq_len']
         target_seq_len = self._params['target_seq_len']
         
-        # Use the correct dimensions based on your data
-        input_size = _JOINT_DIMENSIONS * _NMAJOR_JOINTS  # 34 for 2D, 51 for 3D
-        pose_size = _JOINT_DIMENSIONS * _NMAJOR_JOINTS   # Same as input_size
+        # Now using 3D dimensions (51 features)
+        input_size = _JOINT_DIMENSIONS * _NMAJOR_JOINTS  # 51
+        pose_size = _JOINT_DIMENSIONS * _NMAJOR_JOINTS   # 51
         
         total_frames = source_seq_len + target_seq_len
         src_seq_len = source_seq_len - 1
@@ -126,13 +137,12 @@ class GaitJointsDataset(torch.utils.data.Dataset):
         decoder_inputs = np.zeros((target_seq_len, input_size), dtype=np.float32)
         decoder_outputs = np.zeros((target_seq_len, pose_size), dtype=np.float32)
 
-        # Reshape to [frames, features]
+        # Reshape to [frames, features] - now 51 features
         N = x.shape[0]
-        x = x.reshape(N, -1)
+        x = x.reshape(N, -1)  # Flattens to (frames, 51)
         
         # Ensure we have enough frames
         if N < total_frames:
-            # Pad if sequence is too short
             padding = np.zeros((total_frames - N, x.shape[1]), dtype=x.dtype)
             x = np.vstack([x, padding])
             N = x.shape[0]
@@ -141,19 +151,6 @@ class GaitJointsDataset(torch.utils.data.Dataset):
         start_frame = random.randint(0, max(0, N - total_frames))
         
         data_sel = x[start_frame:(start_frame + total_frames), :]
-        
-        # Ensure data_sel has the right number of features
-        if data_sel.shape[1] != input_size:
-            print(f"⚠️ Warning: data_sel has {data_sel.shape[1]} features, expected {input_size}")
-            # Pad or truncate if needed
-            if data_sel.shape[1] < input_size:
-                # Pad with zeros
-                pad_width = input_size - data_sel.shape[1]
-                padding = np.zeros((data_sel.shape[0], pad_width), dtype=data_sel.dtype)
-                data_sel = np.hstack([data_sel, padding])
-            else:
-                # Truncate if too many features
-                data_sel = data_sel[:, :input_size]
         
         # Assign to encoder and decoder inputs/outputs
         encoder_inputs[:, :] = data_sel[0:src_seq_len, :input_size]
@@ -178,8 +175,8 @@ def dataset_factory(params, fold):
     params['virtual_dataset_size'] = params['steps_per_epoch'] * params['batch_size']
     params['n_joints'] = _NMAJOR_JOINTS
     
-    # Add joint dimensions to params for model compatibility
-    params['joint_dimensions'] = _JOINT_DIMENSIONS
+    # Update joint dimensions to 3D for model compatibility
+    params['joint_dimensions'] = _JOINT_DIMENSIONS  # Now 3
 
     eval_mode = 'test' if 'test_phase' in params.keys() else 'eval'
     if eval_mode == 'test':
