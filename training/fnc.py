@@ -31,13 +31,12 @@ import sys
 import argparse
 import json
 import time
-import csv  # NEW: Added for CSV logging
+import csv
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
-from sklearn.metrics import classification_report
 from datetime import datetime
 
 from numpyencoder import NumpyEncoder
@@ -79,9 +78,6 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
         # NEW: CSV logging setup
         self.csv_logger = CSVMetricsLogger(params['model_prefix'])
         
-        # MINIMAL CHANGE 1: Set correct number of classes (4 instead of 2)
-        self.num_classes = params.get('num_classes', 4)  # Critical fix for 4 classes
-        
         if self.task == 'downstream':
             # We'll compute actual class weights per-fold during training
             # Placeholder - will be updated with real fold distribution in train_model()
@@ -89,7 +85,7 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
             self._focal_loss_alpha = None  # Will be set per-fold
             self._focal_loss_gamma = 2.0
             
-            print(f'Focal loss initialized for {self.num_classes} classes - weights will be computed per-fold with gamma={self._focal_loss_gamma}')
+            print(f'Focal loss initialized - weights will be computed per-fold with gamma={self._focal_loss_gamma}')
         else:
             print('Using a standard CE loss for activity prediction.')
             
@@ -98,22 +94,9 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
         if self.task != 'downstream':
             return
         
-        # MINIMAL CHANGE 2: Initialize with correct number of classes
-        class_counts = torch.zeros(self.num_classes, dtype=torch.float32)
-        
-        # Debug: check the first batch structure
-        first_batch = next(iter(train_loader))
-        print(f"🔍 Debug - Batch type: {type(first_batch)}")
-        print(f"🔍 Debug - Batch keys: {first_batch.keys()}")
-        
-        # Check the structure of action_ids
-        if 'action_ids' in first_batch:
-            action_ids = first_batch['action_ids']
-            print(f"🔍 Debug - action_ids shape: {action_ids.shape}")
-            print(f"🔍 Debug - action_ids: {action_ids}")
+        class_counts = torch.zeros(4, dtype=torch.float32)
         
         # Count actual samples in this fold
-        batch_count = 0
         for batch in train_loader:
             # Extract labels from the batch dictionary
             if 'action_ids' in batch:
@@ -121,29 +104,16 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
                 
                 # Ensure labels are 1D for bincount
                 if labels.dim() > 1:
-                    # If labels are 2D (batch_size, 1), squeeze to 1D
                     labels = labels.squeeze()
                 elif labels.dim() == 0:
-                    # If it's a scalar, make it 1D
                     labels = labels.unsqueeze(0)
                 
                 # Convert to long and ensure it's 1D
                 labels = labels.long().flatten()
                 
-                print(f"🔍 Debug - Processed labels shape: {labels.shape}")
-                print(f"🔍 Debug - Processed labels: {labels}")
-                
                 # Count classes
                 if labels.dim() == 1:
-                    class_counts += torch.bincount(labels, minlength=self.num_classes)
-                else:
-                    print(f"❌ Error: Labels still not 1D, shape: {labels.shape}")
-            
-            batch_count += 1
-            if batch_count >= 2:  # Check first 2 batches
-                break
-        
-        print(f"🔍 Debug - Class counts after {batch_count} batches: {class_counts}")
+                    class_counts += torch.bincount(labels, minlength=4)
         
         # Prevent division by zero for missing classes
         class_counts = torch.clamp(class_counts, min=1)
@@ -170,8 +140,6 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
         """Computes entropy loss from logits between predictions and class."""
         class_gt = class_gt.long()  # Convert to long type
         if self.task == 'downstream':
-            # REPLACED: Use focal loss instead of cross entropy
-            # return self._weighted_ce_loss(logits, class_gt)
             return focal_loss(logits, class_gt, alpha=self._focal_loss_alpha, gamma=self._focal_loss_gamma)
         else:
             return nn.functional.cross_entropy(logits, class_gt, reduction='mean')
@@ -216,26 +184,6 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
         )
 
     def select_optimizer(self):
-        # For imbalanced datasets, consider these optimizers:
-        
-        # Option 1: AdamW with adjusted parameters (recommended)
-        # optimizer = optim.AdamW(
-        #     self._model.parameters(), 
-        #     lr=self._params['learning_rate'],
-        #     betas=(0.9, 0.999),
-        #     weight_decay=_WEIGHT_DECAY
-        # )
-        
-        # Option 2: SGD with momentum (sometimes better for imbalanced data)
-        # optimizer = optim.SGD(
-        #     self._model.parameters(),
-        #     lr=self._params['learning_rate'],
-        #     momentum=0.9,
-        #     weight_decay=_WEIGHT_DECAY,
-        #     nesterov=True
-        # )
-        
-        # Option 3: Adam with AMSGrad (more stable for imbalanced data)
         optimizer = optim.Adam(
             self._model.parameters(),
             lr=self._params['learning_rate'],
@@ -395,7 +343,6 @@ class CSVMetricsLogger:
                 f"{total_training_time:.2f}"
             ])
 
-
 def dataset_factory(params, fold, model_prefix):
   if params['dataset'] == 'ntu_rgbd':
     return NTURGDDataset.dataset_factory(params)
@@ -458,192 +405,151 @@ def count_folds(data_path):
     
     return len(valid_folds)
 
-# def compute_comprehensive_metrics(y_true, y_pred, num_classes):
-#     """
-#     Compute comprehensive classification metrics including per-class and overall metrics.
-#     """
-#     metrics = {}
+def compute_per_class_metrics(y_true, y_pred, class_id):
+    """
+    Compute metrics for a specific class (treated as binary classification).
+    """
+    # Convert to binary classification for this class
+    y_true_binary = (np.array(y_true) == class_id).astype(int)
+    y_pred_binary = (np.array(y_pred) == class_id).astype(int)
     
-#     # Basic metrics
-#     metrics['accuracy'] = accuracy_score(y_true, y_pred)
-#     metrics['precision_macro'] = precision_score(y_true, y_pred, average='macro', zero_division=0)
-#     metrics['recall_macro'] = recall_score(y_true, y_pred, average='macro', zero_division=0)
-#     metrics['f1_macro'] = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    # Handle case with no samples of this class
+    if np.sum(y_true_binary) == 0 and np.sum(y_pred_binary) == 0:
+        return {
+            'support': 0,
+            'precision': 0.0,
+            'recall': 0.0,
+            'f1': 0.0,
+            'accuracy': 1.0  # Perfect accuracy when no samples exist
+        }
     
-#     metrics['precision_weighted'] = precision_score(y_true, y_pred, average='weighted', zero_division=0)
-#     metrics['recall_weighted'] = recall_score(y_true, y_pred, average='weighted', zero_division=0)
-#     metrics['f1_weighted'] = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+    # Handle case with no true samples but some predicted
+    if np.sum(y_true_binary) == 0:
+        return {
+            'support': 0,
+            'precision': 0.0,
+            'recall': 0.0,
+            'f1': 0.0,
+            'accuracy': accuracy_score(y_true_binary, y_pred_binary, zero_division=0)
+        }
     
-#     # Per-class metrics
-#     if num_classes > 1:
-#         metrics['precision_per_class'] = precision_score(y_true, y_pred, average=None, zero_division=0).tolist()
-#         metrics['recall_per_class'] = recall_score(y_true, y_pred, average=None, zero_division=0).tolist()
-#         metrics['f1_per_class'] = f1_score(y_true, y_pred, average=None, zero_division=0).tolist()
+    # Handle case with no predicted samples but some true
+    if np.sum(y_pred_binary) == 0:
+        return {
+            'support': np.sum(y_true_binary),
+            'precision': 0.0,
+            'recall': 0.0,
+            'f1': 0.0,
+            'accuracy': accuracy_score(y_true_binary, y_pred_binary, zero_division=0)
+        }
     
-#     # Confusion matrix
-#     metrics['confusion_matrix'] = confusion_matrix(y_true, y_pred).tolist()
-    
-#     # Class distribution
-#     metrics['true_class_distribution'] = np.bincount(y_true, minlength=num_classes).tolist()
-#     metrics['pred_class_distribution'] = np.bincount(y_pred, minlength=num_classes).tolist()
-    
-#     return metrics
-def compute_comprehensive_metrics(y_true, y_pred, num_classes):
+    return {
+        'support': np.sum(y_true_binary),
+        'precision': precision_score(y_true_binary, y_pred_binary, zero_division=0),
+        'recall': recall_score(y_true_binary, y_pred_binary, zero_division=0),
+        'f1': f1_score(y_true_binary, y_pred_binary, zero_division=0),
+        'accuracy': accuracy_score(y_true_binary, y_pred_binary)
+    }
+
+def compute_comprehensive_metrics(y_true, y_pred, class_names=None):
     """
     Compute comprehensive classification metrics including per-class and overall metrics.
     """
     metrics = {}
+    unique_classes = np.unique(np.concatenate([y_true, y_pred]))
+    num_classes = len(unique_classes)
     
-    # Get actual number of classes from data
-    actual_num_classes = len(np.unique(np.concatenate([y_true, y_pred])))
-    
-    # Basic metrics
+    # Overall metrics with zero_division=0 to avoid warnings
     metrics['accuracy'] = accuracy_score(y_true, y_pred)
     metrics['precision_macro'] = precision_score(y_true, y_pred, average='macro', zero_division=0)
     metrics['recall_macro'] = recall_score(y_true, y_pred, average='macro', zero_division=0)
     metrics['f1_macro'] = f1_score(y_true, y_pred, average='macro', zero_division=0)
-    
     metrics['precision_weighted'] = precision_score(y_true, y_pred, average='weighted', zero_division=0)
     metrics['recall_weighted'] = recall_score(y_true, y_pred, average='weighted', zero_division=0)
     metrics['f1_weighted'] = f1_score(y_true, y_pred, average='weighted', zero_division=0)
     
     # Per-class metrics
-    if actual_num_classes > 1:
-        metrics['precision_per_class'] = precision_score(y_true, y_pred, average=None, zero_division=0).tolist()
-        metrics['recall_per_class'] = recall_score(y_true, y_pred, average=None, zero_division=0).tolist()
-        metrics['f1_per_class'] = f1_score(y_true, y_pred, average=None, zero_division=0).tolist()
+    metrics['per_class'] = {}
+    for class_id in range(4):  # Always include all 4 classes (0-3)
+        class_name = str(class_id) if class_names is None else class_names[class_id]
+        metrics['per_class'][class_name] = compute_per_class_metrics(y_true, y_pred, class_id)
     
-    # Confusion matrix
-    metrics['confusion_matrix'] = confusion_matrix(y_true, y_pred).tolist()
+    # Confusion matrix - ensure it includes all classes 0-3
+    all_classes = list(range(4))
+    metrics['confusion_matrix'] = confusion_matrix(y_true, y_pred, labels=all_classes).tolist()
     
     # Class distribution
-    metrics['true_class_distribution'] = np.bincount(y_true, minlength=actual_num_classes).tolist()
-    metrics['pred_class_distribution'] = np.bincount(y_pred, minlength=actual_num_classes).tolist()
+    metrics['true_distribution'] = {str(cls): int(count) for cls, count in zip(all_classes, np.bincount(y_true, minlength=4))}
+    metrics['pred_distribution'] = {str(cls): int(count) for cls, count in zip(all_classes, np.bincount(y_pred, minlength=4))}
+    
+    # Overall support
+    metrics['support'] = len(y_true)
     
     return metrics
-def print_detailed_report(y_true, y_pred, num_classes):
+
+def print_comprehensive_report(metrics, class_names=None):
     """
-    Print a detailed classification report with comprehensive metrics.
+    Print a comprehensive classification report with per-class and overall metrics.
     """
-    print("\n" + "="*80)
+    print("\n" + "="*100)
     print("COMPREHENSIVE CLASSIFICATION REPORT")
-    print("="*80)
+    print("="*100)
     
-    # Get the actual number of classes from the data
-    actual_num_classes = len(np.unique(np.concatenate([y_true, y_pred])))
+    # Overall metrics
+    print("\nOVERALL METRICS:")
+    print(f"  Accuracy:              {metrics['accuracy']:.4f}")
+    print(f"  Precision (macro):     {metrics['precision_macro']:.4f}")
+    print(f"  Recall (macro):        {metrics['recall_macro']:.4f}")
+    print(f"  F1-Score (macro):      {metrics['f1_macro']:.4f}")
+    print(f"  Precision (weighted):  {metrics['precision_weighted']:.4f}")
+    print(f"  Recall (weighted):     {metrics['recall_weighted']:.4f}")
+    print(f"  F1-Score (weighted):   {metrics['f1_weighted']:.4f}")
+    print(f"  Total Samples:         {metrics['support']}")
     
-    # Basic metrics
-    accuracy = accuracy_score(y_true, y_pred)
-    precision_macro = precision_score(y_true, y_pred, average='macro', zero_division=0)
-    recall_macro = recall_score(y_true, y_pred, average='macro', zero_division=0)
-    f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    # Per-class metrics
+    print("\nPER-CLASS METRICS:")
+    print("-" * 90)
+    header = f"{'Class':<15} {'Precision':<10} {'Recall':<10} {'F1-Score':<10} {'Accuracy':<10} {'Support':<8}"
+    print(header)
+    print("-" * 90)
     
-    print(f"\nOverall Metrics:")
-    print(f"  Accuracy:    {accuracy:.4f}")
-    print(f"  Precision:   {precision_macro:.4f} (macro)")
-    print(f"  Recall:      {recall_macro:.4f} (macro)")
-    print(f"  F1-Score:    {f1_macro:.4f} (macro)")
-    
-    # Weighted metrics
-    precision_weighted = precision_score(y_true, y_pred, average='weighted', zero_division=0)
-    recall_weighted = recall_score(y_true, y_pred, average='weighted', zero_division=0)
-    f1_weighted = f1_score(y_true, y_pred, average='weighted', zero_division=0)
-    
-    print(f"  Precision:   {precision_weighted:.4f} (weighted)")
-    print(f"  Recall:      {recall_weighted:.4f} (weighted)")
-    print(f"  F1-Score:    {f1_weighted:.4f} (weighted)")
-    
-    # Per-class metrics - use actual_num_classes instead of num_classes parameter
-    if actual_num_classes > 1:
-        print(f"\nPer-Class Metrics:")
-        precision_per_class = precision_score(y_true, y_pred, average=None, zero_division=0)
-        recall_per_class = recall_score(y_true, y_pred, average=None, zero_division=0)
-        f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
-        
-        for i in range(actual_num_classes):  # Use actual_num_classes here
-            print(f"  Class {i}: Precision={precision_per_class[i]:.4f}, "
-                  f"Recall={recall_per_class[i]:.4f}, F1={f1_per_class[i]:.4f}")
+    for class_idx in range(4):  # Always show all 4 classes
+        class_name = str(class_idx) if class_names is None else class_names[class_idx]
+        class_metrics = metrics['per_class'][class_name]
+        print(
+            f"{class_name:<15} "
+            f"{class_metrics['precision']:<10.4f} "
+            f"{class_metrics['recall']:<10.4f} "
+            f"{class_metrics['f1']:<10.4f} "
+            f"{class_metrics['accuracy']:<10.4f} "
+            f"{class_metrics['support']:<8}"
+        )
     
     # Confusion matrix
-    cm = confusion_matrix(y_true, y_pred)
-    print(f"\nConfusion Matrix:")
-    print(" " * 8 + "".join([f"Pred {i:>6}" for i in range(actual_num_classes)]))  # Use actual_num_classes here
-    for i in range(actual_num_classes):  # Use actual_num_classes here
-        if i == 0:
-            print(f"True {i}  " + " ".join([f"{val:6d}" for val in cm[i]]))
-        else:
-            print(f"     {i}  " + " ".join([f"{val:6d}" for val in cm[i]]))
+    print("\nCONFUSION MATRIX:")
+    cm = np.array(metrics['confusion_matrix'])
+    class_labels = [str(i) if class_names is None else class_names[i] for i in range(4)]
+    
+    # Print header
+    header = " " * 15 + "".join([f"{label:>12}" for label in class_labels])
+    print(header)
+    
+    # Print rows
+    for i, row in enumerate(cm):
+        row_str = f"{class_labels[i]:<15}" + "".join([f"{val:>12}" for val in row])
+        print(row_str)
     
     # Class distribution
-    true_dist = np.bincount(y_true, minlength=actual_num_classes)  # Use actual_num_classes here
-    pred_dist = np.bincount(y_pred, minlength=actual_num_classes)  # Use actual_num_classes here
+    print("\nCLASS DISTRIBUTION:")
+    print(f"{'':<15} {'True':<10} {'Predicted':<10}")
+    print("-" * 35)
+    for class_idx in range(4):
+        class_name = str(class_idx) if class_names is None else class_names[class_idx]
+        true_count = metrics['true_distribution'].get(str(class_idx), 0)
+        pred_count = metrics['pred_distribution'].get(str(class_idx), 0)
+        print(f"{class_name:<15} {true_count:<10} {pred_count:<10}")
     
-    print(f"\nClass Distribution:")
-    print(f"  True: {dict(enumerate(true_dist))}")
-    print(f"  Pred: {dict(enumerate(pred_dist))}")
-    
-    print("="*80)
-    
-    return actual_num_classes  # Return the actual number of classes found
-# def print_detailed_report(y_true, y_pred, num_classes):
-#     """
-#     Print a detailed classification report with comprehensive metrics.
-#     """
-#     print("\n" + "="*80)
-#     print("COMPREHENSIVE CLASSIFICATION REPORT")
-#     print("="*80)
-    
-#     # Basic metrics
-#     accuracy = accuracy_score(y_true, y_pred)
-#     precision_macro = precision_score(y_true, y_pred, average='macro', zero_division=0)
-#     recall_macro = recall_score(y_true, y_pred, average='macro', zero_division=0)
-#     f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
-    
-#     print(f"\nOverall Metrics:")
-#     print(f"  Accuracy:    {accuracy:.4f}")
-#     print(f"  Precision:   {precision_macro:.4f} (macro)")
-#     print(f"  Recall:      {recall_macro:.4f} (macro)")
-#     print(f"  F1-Score:    {f1_macro:.4f} (macro)")
-    
-#     # Weighted metrics
-#     precision_weighted = precision_score(y_true, y_pred, average='weighted', zero_division=0)
-#     recall_weighted = recall_score(y_true, y_pred, average='weighted', zero_division=0)
-#     f1_weighted = f1_score(y_true, y_pred, average='weighted', zero_division=0)
-    
-#     print(f"  Precision:   {precision_weighted:.4f} (weighted)")
-#     print(f"  Recall:      {recall_weighted:.4f} (weighted)")
-#     print(f"  F1-Score:    {f1_weighted:.4f} (weighted)")
-    
-#     # Per-class metrics
-#     if num_classes > 1:
-#         print(f"\nPer-Class Metrics:")
-#         precision_per_class = precision_score(y_true, y_pred, average=None, zero_division=0)
-#         recall_per_class = recall_score(y_true, y_pred, average=None, zero_division=0)
-#         f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
-        
-#         for i in range(num_classes):
-#             print(f"  Class {i}: Precision={precision_per_class[i]:.4f}, "
-#                   f"Recall={recall_per_class[i]:.4f}, F1={f1_per_class[i]:.4f}")
-    
-#     # Confusion matrix
-#     cm = confusion_matrix(y_true, y_pred)
-#     print(f"\nConfusion Matrix:")
-#     print(" " * 8 + "".join([f"Pred {i:>6}" for i in range(num_classes)]))
-#     for i in range(num_classes):
-#         if i == 0:
-#             print(f"True {i}  " + " ".join([f"{val:6d}" for val in cm[i]]))
-#         else:
-#             print(f"     {i}  " + " ".join([f"{val:6d}" for val in cm[i]]))
-    
-#     # Class distribution
-#     true_dist = np.bincount(y_true, minlength=num_classes)
-#     pred_dist = np.bincount(y_pred, minlength=num_classes)
-    
-#     print(f"\nClass Distribution:")
-#     print(f"  True: {dict(enumerate(true_dist))}")
-#     print(f"  Pred: {dict(enumerate(pred_dist))}")
-    
-#     print("="*80)
+    print("="*100)
 
 if __name__ == '__main__':
   parser = argparse.ArgumentParser()
@@ -700,11 +606,9 @@ if __name__ == '__main__':
   
   params = vars(args)
   
-  # Count folds for downstream task (using the correct flat structure)
+  # Count folds for downstream task
   if params['task'] == 'downstream':
-#    num_folds = count_folds(params['data_path'])
-    # MINIMAL CHANGE 3: Correct fold count for single split
-    num_folds = 1  # Critical fix for single train-validation split
+    num_folds = 1 
   else:
     num_folds = 1
 
@@ -715,6 +619,12 @@ if __name__ == '__main__':
   
   # NEW: Track training time
   total_training_start = time.time()
+  
+  # Define class names for better reporting
+  CLASS_NAMES = ['none', 'mild', 'moderate', 'severe']
+  
+  # To store CSV logger from last fold
+  csv_logger = None
 
   all_folds = range(1, num_folds + 1)
   for fold in all_folds:
@@ -741,6 +651,9 @@ if __name__ == '__main__':
         pose_encoder_fn, pose_decoder_fn
     )
     
+    # Keep reference to CSV logger for final report
+    csv_logger = model_fn.csv_logger
+    
     # NEW: Update model with actual fold class distribution
     model_fn.update_fold_weights(train_dataset_fn)  # Compute per-fold weights
     
@@ -750,7 +663,19 @@ if __name__ == '__main__':
     if params['task'] == 'downstream':
       predictions, gts, pred_probs = model_fn.train()
 
-      print('predictions:', predictions)
+      # Convert predictions and gts to numpy arrays if they aren't already
+      predictions = np.array(predictions)
+      gts = np.array(gts)
+      
+      # Compute fold metrics
+      fold_metrics = compute_comprehensive_metrics(gts, predictions, class_names=CLASS_NAMES)
+      print_comprehensive_report(fold_metrics, class_names=CLASS_NAMES)
+      
+      # Save fold metrics to JSON
+      fold_metrics_path = os.path.join(params['model_prefix'], f'fold_{fold}_metrics.json')
+      with open(fold_metrics_path, 'w') as f:
+          json.dump(fold_metrics, f, indent=4, cls=NumpyEncoder)
+      print(f"✓ Fold {fold} metrics saved to: {fold_metrics_path}")
 
       # save predicted classes
       preds_votes.append(predictions.tolist())
@@ -768,11 +693,6 @@ if __name__ == '__main__':
       total_gts.append(int(gt))
 
       del model_fn, pose_encoder_fn, pose_decoder_fn
-
-      attributes = [preds_votes, total_preds, preds_probs, total_gts]
-      names = ['predicted_classes', 'predicted_final_classes', 'prediction_list', 'true_labels']
-      jsonfilename = os.path.join(params['model_prefix'], 'results.json')        
-      save_json(jsonfilename, attributes, names)
     else:
       model_fn.train()
 
@@ -782,22 +702,20 @@ if __name__ == '__main__':
   if params['task'] == 'downstream':
     # Only generate report if we have actual data
     if len(total_gts) > 0 and len(total_preds) > 0:
+        # Convert to numpy arrays for consistency
+        total_gts = np.array(total_gts)
+        total_preds = np.array(total_preds)
+        
         # Get number of classes from parameter or infer from data
         num_classes = params.get('num_classes', len(np.unique(total_gts + total_preds)))
         
         print("\n" + "="*80)
         print("=== Final Classification Report ===")
-        print(classification_report(total_gts, total_preds))
-        print(f"Overall accuracy: {accuracy_score(total_gts, total_preds):.4f}")
         print("="*80)
         
         # NEW: Comprehensive metrics and detailed report
-        comprehensive_metrics = compute_comprehensive_metrics(total_gts, total_preds, num_classes)
-        print_detailed_report(total_gts, total_preds, num_classes)
-        
-        # NEW: Log final metrics to CSV
-        if 'model_fn' in locals():
-            model_fn.csv_logger.log_final_metrics(num_folds, comprehensive_metrics, total_training_time)
+        comprehensive_metrics = compute_comprehensive_metrics(total_gts, total_preds, class_names=CLASS_NAMES)
+        print_comprehensive_report(comprehensive_metrics, class_names=CLASS_NAMES)
         
         # Save comprehensive metrics to JSON
         metrics_filename = os.path.join(params['model_prefix'], 'comprehensive_metrics.json')
@@ -805,12 +723,18 @@ if __name__ == '__main__':
             json.dump(comprehensive_metrics, f, indent=4, cls=NumpyEncoder)
         print(f"✓ Comprehensive metrics saved to: {metrics_filename}")
         
-        # NEW: Print CSV file locations
-        print(f"\n✓ CSV logs saved to:")
-        print(f"  Epoch metrics: {model_fn.csv_logger.epochs_csv_path}")
-        print(f"  Fold metrics: {model_fn.csv_logger.folds_csv_path}")
-        print(f"  Final metrics: {model_fn.csv_logger.final_metrics_csv_path}")
+        # NEW: Log final metrics to CSV if available
+        if csv_logger is not None:
+            csv_logger.log_final_metrics(num_folds, comprehensive_metrics, total_training_time)
+            
+            # Print CSV file locations
+            print(f"\n✓ CSV logs saved to:")
+            print(f"  Epoch metrics: {csv_logger.epochs_csv_path}")
+            print(f"  Fold metrics: {csv_logger.folds_csv_path}")
+            print(f"  Final metrics: {csv_logger.final_metrics_csv_path}")
+        
         print(f"✓ Total training time: {total_training_time:.2f} seconds")
+        print("="*80)
         
     else:
         print("\nWARNING: No valid predictions were generated.")
