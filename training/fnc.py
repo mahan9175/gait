@@ -79,15 +79,15 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
         # NEW: CSV logging setup
         self.csv_logger = CSVMetricsLogger(params['model_prefix'])
         
-        # CRITICAL: Set correct number of classes based on your actual problem
-        # This should match what's in your model configuration
-        self.num_classes = params.get('num_classes', 4)  # Set to 2 for your binary classification
+        # MINIMAL CHANGE 1: Set correct number of classes (4 instead of 2)
+        self.num_classes = params.get('num_classes', 4)  # Critical fix for 4 classes
         
         if self.task == 'downstream':
             # We'll compute actual class weights per-fold during training
+            # Placeholder - will be updated with real fold distribution in train_model()
             self._loss_weights = None
             self._focal_loss_alpha = None  # Will be set per-fold
-            self._focal_loss_gamma = 3.0
+            self._focal_loss_gamma = 2.0
             
             print(f'Focal loss initialized for {self.num_classes} classes - weights will be computed per-fold with gamma={self._focal_loss_gamma}')
         else:
@@ -98,61 +98,67 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
         if self.task != 'downstream':
             return
         
-        # Initialize counters for the correct number of classes
+        # MINIMAL CHANGE 2: Initialize with correct number of classes
         class_counts = torch.zeros(self.num_classes, dtype=torch.float32)
         
-        # Process ALL batches to get accurate class distribution
-        total_samples = 0
+        # Debug: check the first batch structure
+        first_batch = next(iter(train_loader))
+        print(f"🔍 Debug - Batch type: {type(first_batch)}")
+        print(f"🔍 Debug - Batch keys: {first_batch.keys()}")
+        
+        # Check the structure of action_ids
+        if 'action_ids' in first_batch:
+            action_ids = first_batch['action_ids']
+            print(f"🔍 Debug - action_ids shape: {action_ids.shape}")
+            print(f"🔍 Debug - action_ids: {action_ids}")
+        
+        # Count actual samples in this fold
+        batch_count = 0
         for batch in train_loader:
-            if 'action_ids' not in batch:
-                continue
+            # Extract labels from the batch dictionary
+            if 'action_ids' in batch:
+                labels = batch['action_ids']
                 
-            labels = batch['action_ids']
-            # Convert to long and flatten all dimensions
-            labels = labels.long().flatten()
-            
-            # Filter out any invalid class indices
-            valid_mask = (labels >= 0) & (labels < self.num_classes)
-            valid_labels = labels[valid_mask]
-            
-            if len(valid_labels) == 0:
-                continue
+                # Ensure labels are 1D for bincount
+                if labels.dim() > 1:
+                    # If labels are 2D (batch_size, 1), squeeze to 1D
+                    labels = labels.squeeze()
+                elif labels.dim() == 0:
+                    # If it's a scalar, make it 1D
+                    labels = labels.unsqueeze(0)
                 
-            # Count classes in this batch
-            batch_counts = torch.bincount(valid_labels, minlength=self.num_classes)
-            class_counts += batch_counts
-            total_samples += len(valid_labels)
-
-        # Validate we have data
-        if total_samples == 0:
-            raise ValueError("No valid samples found in training data for class weight calculation")
+                # Convert to long and ensure it's 1D
+                labels = labels.long().flatten()
+                
+                print(f"🔍 Debug - Processed labels shape: {labels.shape}")
+                print(f"🔍 Debug - Processed labels: {labels}")
+                
+                # Count classes
+                if labels.dim() == 1:
+                    class_counts += torch.bincount(labels, minlength=self.num_classes)
+                else:
+                    print(f"❌ Error: Labels still not 1D, shape: {labels.shape}")
+            
+            batch_count += 1
+            if batch_count >= 2:  # Check first 2 batches
+                break
         
-        # Calculate class distribution percentages
-        class_percentages = (class_counts / total_samples) * 100
+        print(f"🔍 Debug - Class counts after {batch_count} batches: {class_counts}")
         
-        # Calculate imbalance ratio (larger class / smaller class)
-        min_count = torch.min(class_counts)
-        max_count = torch.max(class_counts)
-        imbalance_ratio = max_count / (min_count + 1e-6)
         # Prevent division by zero for missing classes
         class_counts = torch.clamp(class_counts, min=1)
         
-        # Compute normalized inverse frequency weights
+        # Compute weights (inverse frequency)
         freq = class_counts / class_counts.sum()
-        weights = 1.0 / (freq + 1e-6)
-        weights = weights / weights.sum()  # Normalize weights
+        weights = 1.0 / (freq + 1e-6)  # small epsilon for stability
+        weights = weights / weights.sum()  # normalize
         
-        # Update model weights
         self._focal_loss_alpha = weights.to(_DEVICE)
         self._loss_weights = weights.to(_DEVICE)
         
-        # Log informative results
-        print(f"📊 Class distribution: Class 0: {class_counts[0]:.0f} ({class_percentages[0]:.1f}%), Class 1: {class_counts[1]:.0f} ({class_percentages[1]:.1f}%)")
-        print(f"⚠️  Imbalance ratio: {imbalance_ratio:.1f}:1 (larger:smaller)")
-        print(f"⚖️  Computed focal loss weights: Class 0: {weights[0]:.4f}, Class 1: {weights[1]:.4f}")
+        print(f"📊 Fold class distribution: {class_counts.cpu().numpy()}")
+        print(f"⚖️  Computed focal loss weights: {weights.cpu().numpy()}")
 
-
-    # The rest of your methods remain the same...
     def smooth_l1(self, decoder_pred, decoder_gt):
         l1loss = nn.SmoothL1Loss(reduction='mean')
         return l1loss(decoder_pred, decoder_gt)
@@ -160,6 +166,15 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
     def loss_l1(self, decoder_pred, decoder_gt):
         return nn.L1Loss(reduction='mean')(decoder_pred, decoder_gt)
 
+    def loss_activity(self, logits, class_gt):                                     
+        """Computes entropy loss from logits between predictions and class."""
+        class_gt = class_gt.long()  # Convert to long type
+        if self.task == 'downstream':
+            # REPLACED: Use focal loss instead of cross entropy
+            # return self._weighted_ce_loss(logits, class_gt)
+            return focal_loss(logits, class_gt, alpha=self._focal_loss_alpha, gamma=self._focal_loss_gamma)
+        else:
+            return nn.functional.cross_entropy(logits, class_gt, reduction='mean')
 
     def compute_class_loss(self, class_logits, class_gt):
         """Computes the class loss for each of the decoder layers predictions or memory."""
@@ -168,32 +183,7 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
             class_loss += self.loss_activity(class_logits[l], class_gt)
 
         return class_loss/len(class_logits)
-    def loss_activity(self, logits, class_gt):                                     
-        """Computes entropy loss from logits between predictions and class."""
-        class_gt = class_gt.long()
-        
-        # CRITICAL: Ensure class_gt values are within valid range
-        class_gt = torch.clamp(class_gt, 0, self.num_classes-1)
-        
-        if self.task == 'downstream':
-            # Create weight tensor with correct number of classes
-            if self._focal_loss_alpha is not None:
-                # Make sure weight tensor has the correct size
-                if len(self._focal_loss_alpha) != self.num_classes:
-                    # This is the critical fix - ensure weights match expected class count
-                    print(f"⚠️ Weight tensor size mismatch: expected {self.num_classes} classes, got {len(self._focal_loss_alpha)}")
-                    # Recreate weights with correct size
-                    weights = torch.ones(self.num_classes, device=_DEVICE)
-                    actual_classes = min(len(self._focal_loss_alpha), self.num_classes)
-                    weights[:actual_classes] = self._focal_loss_alpha[:actual_classes]
-                    weights = weights / weights.sum()
-                    self._focal_loss_alpha = weights
-                    print(f"✅ Fixed weight tensor to match {self.num_classes} classes")
-                
-                return focal_loss(logits, class_gt, alpha=self._focal_loss_alpha, gamma=self._focal_loss_gamma)
-            return focal_loss(logits, class_gt, gamma=self._focal_loss_gamma)
-        else:
-            return nn.functional.cross_entropy(logits, class_gt, reduction='mean')
+
     def select_loss_fn(self):
         if self._params['loss_fn'] == 'mse':
             return self.loss_mse
@@ -226,35 +216,35 @@ class POTRModelFn(seq2seq_model_fn.ModelFn):
         )
 
     def select_optimizer(self):
-            # For imbalanced datasets, consider these optimizers:
-            
-            # Option 1: AdamW with adjusted parameters (recommended)
-            # optimizer = optim.AdamW(
-            #     self._model.parameters(), 
-            #     lr=self._params['learning_rate'],
-            #     betas=(0.9, 0.999),
-            #     weight_decay=_WEIGHT_DECAY
-            # )
-            
-            # Option 2: SGD with momentum (sometimes better for imbalanced data)
-            optimizer = optim.SGD(
-                self._model.parameters(),
-                lr=self._params['learning_rate'],
-                momentum=0.9,
-                weight_decay=_WEIGHT_DECAY,
-                nesterov=True
-            )
-            
-            # Option 3: Adam with AMSGrad (more stable for imbalanced data)
-            # optimizer = optim.Adam(
-            #     self._model.parameters(),
-            #     lr=self._params['learning_rate'],
-            #     betas=(0.9, 0.999),
-            #     weight_decay=_WEIGHT_DECAY,
-            #     amsgrad=True
-            # )
-            
-            return optimizer
+        # For imbalanced datasets, consider these optimizers:
+        
+        # Option 1: AdamW with adjusted parameters (recommended)
+        # optimizer = optim.AdamW(
+        #     self._model.parameters(), 
+        #     lr=self._params['learning_rate'],
+        #     betas=(0.9, 0.999),
+        #     weight_decay=_WEIGHT_DECAY
+        # )
+        
+        # Option 2: SGD with momentum (sometimes better for imbalanced data)
+        # optimizer = optim.SGD(
+        #     self._model.parameters(),
+        #     lr=self._params['learning_rate'],
+        #     momentum=0.9,
+        #     weight_decay=_WEIGHT_DECAY,
+        #     nesterov=True
+        # )
+        
+        # Option 3: Adam with AMSGrad (more stable for imbalanced data)
+        optimizer = optim.Adam(
+            self._model.parameters(),
+            lr=self._params['learning_rate'],
+            betas=(0.9, 0.999),
+            weight_decay=_WEIGHT_DECAY,
+            amsgrad=True
+        )
+        
+        return optimizer
 
     # NEW: Override train method to add CSV logging
     def train(self):
@@ -363,7 +353,7 @@ class CSVMetricsLogger:
         
         # Calculate metrics
         accuracy = accuracy_score(true_labels, predictions)
-        precision_macro = precision_score(y_true, y_pred, average='macro', zero_division=0, labels=range(self.model_fn.num_classes) if hasattr(self.model_fn, 'num_classes') else None)
+        precision_macro = precision_score(true_labels, predictions, average='macro', zero_division=0)
         recall_macro = recall_score(true_labels, predictions, average='macro', zero_division=0)
         f1_macro = f1_score(true_labels, predictions, average='macro', zero_division=0)
         precision_weighted = precision_score(true_labels, predictions, average='weighted', zero_division=0)
@@ -585,9 +575,8 @@ def print_detailed_report(y_true, y_pred, num_classes):
             print(f"     {i}  " + " ".join([f"{val:6d}" for val in cm[i]]))
     
     # Class distribution
-    actual_num_classes = len(np.unique(np.concatenate([y_true, y_pred])))
-    true_dist = np.bincount(y_true, minlength=actual_num_classes)
-    pred_dist = np.bincount(y_pred, minlength=actual_num_classes)
+    true_dist = np.bincount(y_true, minlength=actual_num_classes)  # Use actual_num_classes here
+    pred_dist = np.bincount(y_pred, minlength=actual_num_classes)  # Use actual_num_classes here
     
     print(f"\nClass Distribution:")
     print(f"  True: {dict(enumerate(true_dist))}")
@@ -671,9 +660,6 @@ if __name__ == '__main__':
   parser.add_argument('--task', type=str, default='downstream', choices=['pretext', 'downstream'])
   parser.add_argument('--downstream_strategy', default='both_then_class', choices=['both', 'class', 'both_then_class'])
   # pose transformers related parameters
-  # In the argument parser section (around line where other arguments are defined)
-  parser.add_argument('--input_dim', type=int, default=51)
-  parser.add_argument('--pose_dim', type=int, default=51)
   parser.add_argument('--model_dim', type=int, default=256)
   parser.add_argument('--num_encoder_layers', type=int, default=4)
   parser.add_argument('--num_decoder_layers', type=int, default=4)
@@ -717,18 +703,8 @@ if __name__ == '__main__':
   # Count folds for downstream task (using the correct flat structure)
   if params['task'] == 'downstream':
 #    num_folds = count_folds(params['data_path'])
-    num_folds = 1 
-    # Validate fold count
-    if num_folds == 0:
-        print(f"\nERROR: No valid data found in {params['data_path']}")
-        print("Please verify your data structure. Expected format:")
-        print("  data_path/")
-        print("  ├── EPG_train_1.pkl")
-        print("  ├── EPG_test_1.pkl")
-        print("  ├── EPG_train_2.pkl")
-        print("  ├── EPG_test_2.pkl")
-        print("  └── ...")
-        sys.exit(1)
+    # MINIMAL CHANGE 3: Correct fold count for single split
+    num_folds = 1  # Critical fix for single train-validation split
   else:
     num_folds = 1
 
